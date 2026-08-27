@@ -177,6 +177,7 @@ export const yunwuyunAPI = {
   getStats: () => request('/yunwuyun/stats'),
   syncOrders: () => request('/yunwuyun/sync-orders', { method: 'POST' }),
   syncCustomers: () => request('/yunwuyun/sync-customers', { method: 'POST' }),
+  setToken: (token) => request('/yunwuyun/set-token', { method: 'POST', body: JSON.stringify({ token }) }),
 
   // 客户账号管理
   enableLogin: (id, login_account, password) => request(`/yunwuyun/customers/${id}/enable-login`, { method: 'PUT', body: JSON.stringify({ login_account, password }) }),
@@ -211,13 +212,68 @@ export const clientAPI = {
 export const wechatAPI = {
   getConfig: () => request('/wechat/config'),
   saveConfig: (data) => request('/wechat/config', { method: 'PUT', body: JSON.stringify(data) }),
-  testWebhook: (webhook_url) => request('/wechat/test-webhook', { method: 'POST', body: JSON.stringify({ webhook_url }) }),
-  saveCustomerWebhook: (id, data) => request(`/wechat/customer-webhook/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  testConnection: () => request('/wechat/test-connection', { method: 'POST' }),
+  getGroupChats: () => request('/wechat/groupchats'),
+  testSend: (chatid) => request('/wechat/test-send', { method: 'POST', body: JSON.stringify({ chatid }) }),
+  saveCustomerChatid: (id, data) => request(`/wechat/customer-chatid/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   pushOrders: (data) => request('/wechat/push', { method: 'POST', body: JSON.stringify(data) }),
   getLogs: (params = {}) => {
     const query = new URLSearchParams(params).toString();
     return request(`/wechat/logs?${query}`);
   },
+  getRpaQueue: () => request('/wechat/rpa/queue'),
 };
 
 export default { authAPI, customerAPI, dashboardAPI, activityAPI, quoteAPI, reportAPI, yunwuyunAPI, roleAPI, clientAPI, wechatAPI };
+
+// 销售管理
+export const salesAPI = {
+  // 文件上传
+  upload: (file) => {
+    const formData = new FormData();
+    formData.append('file', file);
+    const token = useAuthStore.getState().token;
+    return fetch('/api/sales/upload', { method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: formData }).then(r => r.json());
+  },
+  // 培训资料
+  getMaterials: (params = {}) => { const query = new URLSearchParams(params).toString(); return request(`/sales/materials?${query}`); },
+  getMaterial: (id) => request(`/sales/materials/${id}`),
+  createMaterial: (data) => request('/sales/materials', { method: 'POST', body: JSON.stringify(data) }),
+  updateMaterial: (id, data) => request(`/sales/materials/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  deleteMaterial: (id) => request(`/sales/materials/${id}`, { method: 'DELETE' }),
+  // 话术
+  getScriptScenes: () => request('/sales/scripts/scenes'),
+  getScripts: (params = {}) => { const query = new URLSearchParams(params).toString(); return request(`/sales/scripts?${query}`); },
+  getScript: (id) => request(`/sales/scripts/${id}`),
+  createScript: (data) => request('/sales/scripts', { method: 'POST', body: JSON.stringify(data) }),
+  updateScript: (id, data) => request(`/sales/scripts/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  deleteScript: (id) => request(`/sales/scripts/${id}`, { method: 'DELETE' }),
+  toggleFavorite: (id) => request(`/sales/scripts/${id}/favorite`, { method: 'POST' }),
+  getFavorites: () => request('/sales/scripts/favorites/mine'),
+  // 培训计划
+  getOnboardingPlans: () => request('/sales/onboarding/plans'),
+  getOnboardingPlan: (id) => request(`/sales/onboarding/plans/${id}`),
+  createOnboardingPlan: (data) => request('/sales/onboarding/plans', { method: 'POST', body: JSON.stringify(data) }),
+  updateOnboardingPlan: (id, data) => request(`/sales/onboarding/plans/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  deleteOnboardingPlan: (id) => request(`/sales/onboarding/plans/${id}`, { method: 'DELETE' }),
+  assignOnboarding: (data) => request('/sales/onboarding/assign', { method: 'POST', body: JSON.stringify(data) }),
+  getOnboardingProgress: (userId) => request(`/sales/onboarding/progress/${userId}`),
+  updateOnboardingTask: (id, data) => request(`/sales/onboarding/task/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  getOnboardingSummary: () => request('/sales/onboarding/summary'),
+  // 通话记录
+  getCalls: (params = {}) => { const query = new URLSearchParams(params).toString(); return request(`/sales/calls?${query}`); },
+  getCall: (id) => request(`/sales/calls/${id}`),
+  createCall: (data) => request('/sales/calls', { method: 'POST', body: JSON.stringify(data) }),
+  updateCall: (id, data) => request(`/sales/calls/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  deleteCall: (id) => request(`/sales/calls/${id}`, { method: 'DELETE' }),
+  addCallReview: (id, data) => request(`/sales/calls/${id}/review`, { method: 'POST', body: JSON.stringify(data) }),
+  getCallStats: () => request('/sales/calls/stats/mine'),
+  // 反馈总结
+  getFeedbackList: (params = {}) => { const query = new URLSearchParams(params).toString(); return request(`/sales/feedback?${query}`); },
+  getFeedback: (id) => request(`/sales/feedback/${id}`),
+  createFeedback: (data) => request('/sales/feedback', { method: 'POST', body: JSON.stringify(data) }),
+  updateFeedback: (id, data) => request(`/sales/feedback/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  deleteFeedback: (id) => request(`/sales/feedback/${id}`, { method: 'DELETE' }),
+  // 看板
+  getSalesDashboard: () => request('/sales/dashboard'),
+};

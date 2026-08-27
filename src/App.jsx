@@ -16,6 +16,7 @@ import ClientLogin from './pages/ClientLogin';
 import ClientPortal from './pages/ClientPortal';
 import Yunwuyun from './pages/Yunwuyun';
 import WechatPush from './pages/WechatPush';
+import SalesManagement from './pages/SalesManagement';
 
 function App() {
   const user = useAuthStore((s) => s.user);
@@ -81,6 +82,11 @@ function App() {
           <Route path="/wechat" element={
             <LayoutWrapper>
               <WechatPush />
+            </LayoutWrapper>
+          } />
+          <Route path="/sales" element={
+            <LayoutWrapper>
+              <SalesManagement />
             </LayoutWrapper>
           } />
         </>

@@ -5,10 +5,16 @@ import querystring from 'querystring';
 const BASE_URL = 'https://fms.yunwuyun.com';
 const TENANT_CODE = 'MOGJ';
 
-let cachedToken = 'eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJlYXN5ZnJlaWdodC1zcnYtdXNlciIsImlhdCI6MTc4NjcwNjYyOCwiZXhwIjoxNzg2NzQ5ODI4LCJ0ZW5hbnRJZCI6NTc4MzA0NzAwOSwic3RhZmZJZCI6MTgxNTc3ODg4NzAwOCwidXNlckNvZGUiOiJhZG1pbiIsInJvd29yZ2lkIjoxODE1Nzc4ODc5MDA4LCJ1c2VyVHlwZSI6MTAsInByb2R1Y3RJZCI6MjI2MTIzMDAwOSwidmlydHVhbFN0YXR1cyI6MTB9.UYzO_6ZSPQsgRLp_WoX0YYzIO1l3OfxY_QEZpVzCRCQ';
-let cachedJSESSIONID = '38616B2DC03DF4123AF6C9952D59804F';
-let tokenExpiry = Date.now() + 86400000;
-let loggedIn = true;
+let cachedToken = 'eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJlYXN5ZnJlaWdodC1zcnYtdXNlciIsImlhdCI6MTc4Njg3MDE5NiwiZXhwIjoxNzg2OTEzMzk2LCJ0ZW5hbnRJZCI6NTc4MzA0NzAwOSwic3RhZmZJZCI6MTgxNTc3ODg4NzAwOCwidXNlckNvZGUiOiJhZG1pbiIsInJvd29yZ2lkIjoxODE1Nzc4ODc5MDA4LCJ1c2VyVHlwZSI6MTAsInByb2R1Y3RJZCI6MjI2MTIzMDAwOSwidmlydHVhbFN0YXR1cyI6MTB9.YU47cCMgPo9IWKcjy-AqIb-Wkd7bT-Iik0a2qf0BQKs';
+let cachedJSESSIONID = 'B0E0EE73D36E372BE6322232D7E6ACB0';
+// 解析JWT真实过期时间，避免用过期token请求
+let tokenExpiry = (() => {
+  try {
+    const payload = JSON.parse(Buffer.from(cachedToken.split('.')[1], 'base64').toString('utf8'));
+    return payload.exp * 1000;
+  } catch { return 0; }
+})();
+let loggedIn = Date.now() < tokenExpiry - 60000;
 
 function request(method, path, { body, params, headers = {} } = {}) {
   return new Promise((resolve, reject) => {
@@ -34,6 +40,10 @@ function request(method, path, { body, params, headers = {} } = {}) {
     if (cachedJSESSIONID) {
       defaultHeaders['Cookie'] = 'JSESSIONID=' + cachedJSESSIONID;
     }
+    // 清理无效header
+    Object.keys(defaultHeaders).forEach(k => {
+      if (defaultHeaders[k] === undefined || defaultHeaders[k] === null) delete defaultHeaders[k];
+    });
 
     const options = {
       hostname: url.hostname,
@@ -54,6 +64,11 @@ function request(method, path, { body, params, headers = {} } = {}) {
           if (match) {
             cachedJSESSIONID = match.match(/JSESSIONID=([^;]+)/)?.[1] || cachedJSESSIONID;
           }
+        }
+        // 日志：非查询接口打印响应
+        if (!path.includes('queryFbxOrderList')) {
+          const preview = typeof data === 'string' ? data.slice(0, 200) : JSON.stringify(data).slice(0, 200);
+          console.log(`[云无云] ${method} ${path} → HTTP ${res.statusCode}`, preview);
         }
         try {
           resolve(JSON.parse(data));
@@ -84,14 +99,30 @@ function request(method, path, { body, params, headers = {} } = {}) {
 
 async function login(username = 'admin', password = 'MO1234') {
   console.log('[云无云] 正在登录...');
+  // 登录时清掉所有旧会话信息，也不带 userid/roworgid
+  const oldToken = cachedToken;
+  const oldSession = cachedJSESSIONID;
+  cachedToken = null;
+  cachedJSESSIONID = null;
   const body = querystring.stringify({ username, password, tenantCode: TENANT_CODE });
-  const result = await request('POST', '/api/getToken', { body });
+  const result = await request('POST', '/api/getToken', {
+    body,
+    headers: { 'userid': undefined, 'roworgid': undefined },
+  });
   if (result && result.token) {
     cachedToken = result.token;
-    tokenExpiry = Date.now() + 86400000;
+    try {
+      const payload = JSON.parse(Buffer.from(result.token.split('.')[1], 'base64').toString('utf8'));
+      tokenExpiry = payload.exp * 1000;
+      console.log('[云无云] Token过期时间:', new Date(tokenExpiry).toLocaleString());
+    } catch {
+      tokenExpiry = Date.now() + 86400000;
+    }
     loggedIn = true;
     console.log('[云无云] 登录成功, token:', result.token.slice(0, 20) + '...');
   } else {
+    cachedToken = oldToken;
+    cachedJSESSIONID = oldSession;
     console.log('[云无云] 登录失败:', JSON.stringify(result));
   }
   return result;
@@ -101,6 +132,7 @@ async function ensureLogin() {
   if (loggedIn && cachedToken && Date.now() < tokenExpiry - 60000) {
     return true;
   }
+  console.log('[云无云] Token已过期或未登录，重新登录...');
   await login();
   return !!cachedToken;
 }
@@ -178,7 +210,13 @@ async function syncOrders(progressCallback) {
       headers: { 'Content-Type': 'application/json' },
     });
 
-    if (!data?.success || !data?.result?.records?.length) break;
+    console.log(`[云无云] 第${currentPage}页 API响应: success=${data?.success}, total=${data?.result?.total}, records=${data?.result?.records?.length || 0}`);
+
+    if (!data?.success) {
+      console.log('[云无云] 同步失败，完整响应:', JSON.stringify(data).slice(0, 500));
+      break;
+    }
+    if (!data?.result?.records?.length) break;
 
     const records = data.result.records;
     totalSynced += records.length;

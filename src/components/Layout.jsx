@@ -14,6 +14,7 @@ import {
   ScheduleOutlined,
   CloudSyncOutlined,
   WechatOutlined,
+  ShopOutlined,
 } from '@ant-design/icons';
 import { useNavigate, useLocation } from 'react-router-dom';
 import useAuthStore from '../store/authStore';
@@ -75,6 +76,11 @@ function LayoutWrapper({ children }) {
       key: '/wechat',
       icon: <WechatOutlined />,
       label: '企业微信推送',
+    },
+    {
+      key: '/sales',
+      icon: <ShopOutlined />,
+      label: '销售管理',
     },
     {
       key: '/admin',

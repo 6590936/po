@@ -1,12 +1,13 @@
-// 企业微信推送管理
+// 企业微信推送管理（自建应用）
 import React, { useState, useEffect } from 'react';
 import {
   Card, Table, Row, Col, Form, Input, Button, Space, Tag, Typography, message,
-  Modal, Select, Tabs,
+  Modal, Select, Tabs, Spin,
 } from 'antd';
 import {
   SendOutlined, SettingOutlined, RobotOutlined, WechatOutlined,
   HistoryOutlined, LinkOutlined, ApiOutlined, ReloadOutlined, SaveOutlined,
+  CheckCircleOutlined, SearchOutlined,
 } from '@ant-design/icons';
 import { wechatAPI, yunwuyunAPI } from '../api';
 
@@ -18,7 +19,7 @@ function WechatPush() {
   const [configLoading, setConfigLoading] = useState(false);
   const [form] = Form.useForm();
 
-  // 客户列表（用于 Webhook 配置）
+  // 客户列表（用于 chatid 配置）
   const [customers, setCustomers] = useState([]);
   const [custLoading, setCustLoading] = useState(false);
 
@@ -35,9 +36,19 @@ function WechatPush() {
   const [logLoading, setLogLoading] = useState(false);
   const [logPage, setLogPage] = useState(1);
 
-  // Webhook 编辑弹窗
-  const [webhookModal, setWebhookModal] = useState({ visible: false, customer: null });
-  const [webhookForm] = Form.useForm();
+  // 群聊配置弹窗
+  const [chatidModal, setChatidModal] = useState({ visible: false, customer: null });
+  const [chatidForm] = Form.useForm();
+
+  // 群聊列表
+  const [groupChats, setGroupChats] = useState([]);
+  const [chatFetching, setChatFetching] = useState(false);
+
+  // RPA队列
+  const [rpaQueue, setRpaQueue] = useState([]);
+  const [rpaTotal, setRpaTotal] = useState(0);
+  const [rpaPending, setRpaPending] = useState(0);
+  const [rpaLoading, setRpaLoading] = useState(false);
 
   useEffect(() => {
     fetchConfig();
@@ -90,36 +101,75 @@ function WechatPush() {
     }
   };
 
+  const fetchGroupChats = async () => {
+    setChatFetching(true);
+    try {
+      const res = await wechatAPI.getGroupChats();
+      if (res.success) {
+        setGroupChats(res.data || []);
+        message.success(`拉取到 ${res.data?.length || 0} 个客户群`);
+      } else {
+        message.error(res.error || '拉取失败');
+      }
+    } catch (err) {
+      message.error('拉取群聊列表失败');
+    } finally {
+      setChatFetching(false);
+    }
+  };
+
+  const fetchRpaQueue = async () => {
+    setRpaLoading(true);
+    try {
+      const res = await wechatAPI.getRpaQueue();
+      setRpaQueue(res.data || []);
+      setRpaTotal(res.total || 0);
+      setRpaPending(res.pending || 0);
+    } catch {} finally {
+      setRpaLoading(false);
+    }
+  };
+
   const handleSaveConfig = async (values) => {
     try {
       await wechatAPI.saveConfig(values);
-      message.success('AI 配置保存成功');
+      message.success('配置保存成功');
       fetchConfig();
     } catch (err) {
       message.error('保存失败');
     }
   };
 
-  const handleTestWebhook = async (webhookUrl) => {
-    if (!webhookUrl) {
-      message.warning('请先填写 Webhook 地址');
-      return;
-    }
+  const handleTestConnection = async () => {
     try {
-      const res = await wechatAPI.testWebhook(webhookUrl);
+      const res = await wechatAPI.testConnection();
       if (res.success) message.success(res.message);
       else message.error(res.error);
     } catch (err) {
-      message.error('测试失败');
+      message.error('连接测试失败');
     }
   };
 
-  const handleSaveWebhook = async () => {
+  const handleTestSend = async (chatid) => {
+    if (!chatid) {
+      message.warning('请先填写群聊 chatid');
+      return;
+    }
     try {
-      const values = await webhookForm.validateFields();
-      await wechatAPI.saveCustomerWebhook(webhookModal.customer.client_id, values);
-      message.success('Webhook 配置保存成功');
-      setWebhookModal({ visible: false, customer: null });
+      const res = await wechatAPI.testSend(chatid);
+      if (res.success) message.success(res.message);
+      else message.error(res.error);
+    } catch (err) {
+      message.error('测试发送失败');
+    }
+  };
+
+  const handleSaveChatid = async () => {
+    try {
+      const values = await chatidForm.validateFields();
+      await wechatAPI.saveCustomerChatid(chatidModal.customer.client_id, values);
+      message.success('群聊配置保存成功');
+      setChatidModal({ visible: false, customer: null });
       fetchCustomers();
     } catch (err) {
       if (err.errorFields) return;
@@ -132,8 +182,8 @@ function WechatPush() {
     if (selectedOrders.length === 0) { message.warning('请选择要推送的订单'); return; }
 
     const customer = customers.find(c => c.client_id === selectedClient);
-    if (!customer?.wechat_webhook) {
-      message.warning('该客户未配置企业微信群机器人，请先在下方配置 Webhook');
+    if (!customer?.wechat_webhook && !customer?.wechat_group_name && !customer?.wechat_chatid) {
+      message.warning('该客户未配置推送通道，请先在「客户群聊配置」中设置 Webhook 或群名称');
       return;
     }
 
@@ -159,25 +209,31 @@ function WechatPush() {
   const customerColumns = [
     { title: '客户编码', dataIndex: 'client_code', width: 120 },
     { title: '客户名称', dataIndex: 'client_name', width: 180 },
-    { title: '群名称', dataIndex: 'wechat_group_name', width: 150, render: (v) => v || <Text type="secondary">未设置</Text> },
-    { title: 'Webhook', dataIndex: 'wechat_webhook', width: 200, ellipsis: true,
-      render: (v) => v ? <Tag color="green">已配置</Tag> : <Tag color="default">未配置</Tag> },
+    { title: 'Webhook', dataIndex: 'wechat_webhook', width: 80,
+      render: (v) => v ? <Tag color="blue">内部群</Tag> : <Tag color="default">-</Tag> },
+    { title: 'RPA群名', dataIndex: 'wechat_group_name', width: 120, render: (v) => v || <Text type="secondary">-</Text> },
+    { title: '推送通道', key: 'channel', width: 100,
+      render: (_, r) => {
+        const has = (r.wechat_webhook ? 1 : 0) + (r.wechat_group_name || r.wechat_chatid ? 1 : 0);
+        return <Tag color={has > 0 ? 'green' : 'default'}>{has > 0 ? `${has}个通道` : '未配置'}</Tag>;
+      } },
     { title: '操作', key: 'action', width: 200,
       render: (_, r) => (
         <Space size="small">
           <Button type="link" size="small" icon={<SettingOutlined />}
             onClick={() => {
-              webhookForm.setFieldsValue({
+              chatidForm.setFieldsValue({
                 wechat_webhook: r.wechat_webhook || '',
+                wechat_chatid: r.wechat_chatid || '',
                 wechat_group_name: r.wechat_group_name || '',
               });
-              setWebhookModal({ visible: true, customer: r });
+              setChatidModal({ visible: true, customer: r });
             }}>
-            配置 Webhook
+            配置群聊
           </Button>
-          {r.wechat_webhook && (
+          {r.wechat_chatid && (
             <Button type="link" size="small" icon={<SendOutlined />}
-              onClick={() => handleTestWebhook(r.wechat_webhook)}>测试</Button>
+              onClick={() => handleTestSend(r.wechat_chatid)}>测试</Button>
           )}
         </Space>
       ),
@@ -206,43 +262,122 @@ function WechatPush() {
     { title: '时间', dataIndex: 'created_at', width: 150, render: (v) => v?.slice(0, 19).replace('T', ' ') },
   ];
 
+  const groupChatColumns = [
+    { title: '群名称', dataIndex: 'name', width: 200 },
+    { title: 'ChatID', dataIndex: 'chat_id', width: 250, ellipsis: true },
+    { title: '成员数', dataIndex: 'member_count', width: 80 },
+    { title: '群主', dataIndex: 'owner', width: 120 },
+    { title: '创建时间', dataIndex: 'create_time', width: 120, render: (v) => v ? new Date(v * 1000).toLocaleString('zh-CN') : '-' },
+  ];
+
   const tabItems = [
     {
       key: 'config',
-      label: <span><ApiOutlined />AI 配置</span>,
+      label: <span><ApiOutlined />企业微信配置</span>,
       children: (
-        <Card title={<Space><RobotOutlined /><span>AI 大模型配置</span></Space>} loading={configLoading}>
+        <Card title={<Space><WechatOutlined /><span>企业微信自建应用 + AI 配置</span></Space>} loading={configLoading}>
           <Paragraph type="secondary">
-            配置 AI 大模型用于自动生成订单推送消息。如不配置，将使用模板格式推送。
-            支持 OpenAI 兼容接口（如 DeepSeek、通义千问、GLM 等）。
+            配置企业微信自建应用的 corpid、agentid、secret，以及 AI 大模型（可选）用于自动生成推送消息。
           </Paragraph>
           <Form form={form} onFinish={handleSaveConfig} layout="vertical" style={{ maxWidth: 600 }}>
+            <Title level={5}>企业微信配置</Title>
+            <Row gutter={16}>
+              <Col span={12}>
+                <Form.Item name="corpid" label="企业ID（corpid）" rules={[{ required: true, message: '请输入 corpid' }]}>
+                  <Input placeholder="wwxxxxxxxxxxxx" />
+                </Form.Item>
+              </Col>
+              <Col span={12}>
+                <Form.Item name="agentid" label="应用 AgentId">
+                  <Input placeholder="1000002" />
+                </Form.Item>
+              </Col>
+            </Row>
+            <Form.Item name="secret" label="应用 Secret" rules={[{ required: true, message: '请输入 secret' }]}>
+              <Input.Password placeholder="企业微信应用 secret" />
+            </Form.Item>
+            <Space style={{ marginBottom: 24 }}>
+              <Button icon={<CheckCircleOutlined />} onClick={handleTestConnection}>测试连接</Button>
+              <Text type="secondary">保存配置后点击测试，验证 corpid 和 secret 是否有效</Text>
+            </Space>
+
+            <Title level={5}>客户群回调配置（接收群消息）</Title>
+            <Paragraph type="secondary">
+              在企微管理后台「客户联系 → 客户群 → API → 接收消息」中配置回调URL：
+              <Text code copyable style={{ display: 'block', marginTop: 4 }}>
+                http://你的服务器IP:3001/api/wechat/callback
+              </Text>
+              然后将下面生成的 Token 和 EncodingAESKey 填入企微后台。
+            </Paragraph>
+            <Row gutter={16}>
+              <Col span={12}>
+                <Form.Item name="wework_callback_token" label="回调 Token">
+                  <Input placeholder="自定义一个Token，如：meiou2024" />
+                </Form.Item>
+              </Col>
+              <Col span={12}>
+                <Form.Item name="wework_callback_aeskey" label="EncodingAESKey">
+                  <Input placeholder="企微后台自动生成或自定义43位" />
+                </Form.Item>
+              </Col>
+            </Row>
+            <Form.Item name="bot_name" label="机器人名称">
+              <Input placeholder="机器人暖宝" />
+            </Form.Item>
+
+            <Title level={5}>AI 大模型配置（可选）</Title>
             <Form.Item name="ai_endpoint" label="API 地址">
               <Input placeholder="https://api.deepseek.com/v1/chat/completions" />
             </Form.Item>
-            <Form.Item name="ai_key" label="API Key">
-              <Input.Password placeholder="sk-xxxxxxxx" />
-            </Form.Item>
-            <Form.Item name="ai_model" label="模型名称">
-              <Input placeholder="deepseek-chat（默认 gpt-3.5-turbo）" />
-            </Form.Item>
+            <Row gutter={16}>
+              <Col span={12}>
+                <Form.Item name="ai_key" label="API Key">
+                  <Input.Password placeholder="sk-xxxxxxxx" />
+                </Form.Item>
+              </Col>
+              <Col span={12}>
+                <Form.Item name="ai_model" label="模型名称">
+                  <Input placeholder="deepseek-chat" />
+                </Form.Item>
+              </Col>
+            </Row>
             <Button type="primary" htmlType="submit" icon={<SaveOutlined />}>保存配置</Button>
           </Form>
         </Card>
       ),
     },
     {
-      key: 'webhook',
-      label: <span><LinkOutlined />客户 Webhook 配置</span>,
+      key: 'chatid',
+      label: <span><LinkOutlined />客户群聊配置</span>,
       children: (
         <Card
-          title={<Space><WechatOutlined /><span>客户企业微信群机器人配置</span></Space>}
-          extra={<Button icon={<ReloadOutlined />} onClick={fetchCustomers}>刷新</Button>}
+          title={<Space><WechatOutlined /><span>客户企业微信群聊配置</span></Space>}
+          extra={
+            <Space>
+              <Button icon={<SearchOutlined />} onClick={fetchGroupChats} loading={chatFetching}>
+                拉取企业微信群聊列表
+              </Button>
+              <Button icon={<ReloadOutlined />} onClick={fetchCustomers}>刷新</Button>
+            </Space>
+          }
         >
           <Paragraph type="secondary">
-            为每个客户配置对应的企业微信群机器人 Webhook 地址。
-            在企业微信群聊中 → 群设置 → 群机器人 → 添加机器人 → 复制 Webhook 地址。
+            为每个客户绑定对应的企业微信客户群。点击「拉取企业微信群聊列表」获取所有客户群的 chatid，
+            然后在配置弹窗中选择或填入对应的 chatid。
           </Paragraph>
+
+          {groupChats.length > 0 && (
+            <Card title="企业微信客户群列表" size="small" style={{ marginBottom: 16 }}>
+              <Table
+                columns={groupChatColumns}
+                dataSource={groupChats}
+                rowKey="chat_id"
+                size="small"
+                pagination={{ pageSize: 10 }}
+              />
+            </Card>
+          )}
+
           <Table
             columns={customerColumns}
             dataSource={customers}
@@ -269,9 +404,9 @@ function WechatPush() {
                 value={selectedClient}
                 onChange={(v) => { setSelectedClient(v); setSelectedOrders([]); fetchOrders(v); }}
                 allowClear
-                options={customers.filter(c => c.wechat_webhook).map(c => ({
+                options={customers.filter(c => c.wechat_webhook || c.wechat_group_name || c.wechat_chatid).map(c => ({
                   value: c.client_id,
-                  label: `${c.client_name} (${c.client_code}) ${c.wechat_group_name ? `- ${c.wechat_group_name}` : ''}`,
+                  label: `${c.client_name} (${c.client_code}) ${c.wechat_group_name ? `→ ${c.wechat_group_name}` : c.wechat_webhook ? '→ 内部群' : ''}`,
                 }))}
               />
             </Col>
@@ -322,6 +457,50 @@ function WechatPush() {
         </Card>
       ),
     },
+    {
+      key: 'rpa',
+      label: <span><RobotOutlined />RPA队列</span>,
+      children: (
+        <Card
+          title={<Space><RobotOutlined /><span>RPA消息队列</span></Space>}
+          extra={
+            <Space>
+              <Tag color="blue">待发送：{rpaPending} 条</Tag>
+              <Tag>总计：{rpaTotal} 条</Tag>
+              <Button icon={<ReloadOutlined />} onClick={fetchRpaQueue} loading={rpaLoading}>刷新</Button>
+            </Space>
+          }
+        >
+          <Paragraph type="secondary">
+            影刀RPA或其他自动化工具轮询此队列，读取待发送消息后自动发到企业微信群。
+            API地址：<Text code copyable>GET /wechat/rpa/pending?token=meiou-rpa-2024</Text>
+          </Paragraph>
+          <Table
+            columns={[
+              { title: 'ID', dataIndex: 'id', width: 50 },
+              { title: '客户', dataIndex: 'client_name', width: 120 },
+              { title: '目标群', dataIndex: 'group_name', width: 150 },
+              { title: '订单ID', dataIndex: 'order_ids', width: 100, ellipsis: true },
+              { title: '内容', dataIndex: 'content', width: 300, ellipsis: true },
+              { title: '状态', dataIndex: 'status', width: 80,
+                render: (v) => {
+                  const map = { pending: 'orange', sent: 'green', failed: 'red' };
+                  return <Tag color={map[v] || 'default'}>{v === 'pending' ? '待发送' : v === 'sent' ? '已发送' : '失败'}</Tag>;
+                } },
+              { title: '错误', dataIndex: 'error_msg', width: 120, ellipsis: true, render: (v) => v || '-' },
+              { title: '创建时间', dataIndex: 'created_at', width: 150, render: (v) => v?.slice(0, 19).replace('T', ' ') },
+              { title: '发送时间', dataIndex: 'sent_at', width: 150, render: (v) => v ? v.slice(0, 19).replace('T', ' ') : '-' },
+            ]}
+            dataSource={rpaQueue}
+            rowKey="id"
+            loading={rpaLoading}
+            pagination={{ pageSize: 20, showTotal: (t) => `共 ${t} 条` }}
+            size="small"
+            scroll={{ x: 1000 }}
+          />
+        </Card>
+      ),
+    },
   ];
 
   return (
@@ -331,38 +510,57 @@ function WechatPush() {
       </Title>
       <Tabs
         activeKey={activeTab}
-        onChange={(key) => { setActiveTab(key); if (key === 'logs') fetchLogs(); }}
+        onChange={(key) => { setActiveTab(key); if (key === 'logs') fetchLogs(); if (key === 'rpa') fetchRpaQueue(); }}
         items={tabItems}
         size="large"
       />
 
-      {/* Webhook 配置弹窗 */}
+      {/* 群聊配置弹窗 */}
       <Modal
-        title={`配置 Webhook - ${webhookModal.customer?.client_name || ''}`}
-        open={webhookModal.visible}
-        onOk={handleSaveWebhook}
-        onCancel={() => setWebhookModal({ visible: false, customer: null })}
+        title={`配置群聊 - ${chatidModal.customer?.client_name || ''}`}
+        open={chatidModal.visible}
+        onOk={handleSaveChatid}
+        onCancel={() => setChatidModal({ visible: false, customer: null })}
         okText="保存"
         cancelText="取消"
-        width={560}
+        width={600}
         destroyOnHidden
       >
-        <Form form={webhookForm} layout="vertical">
-          <Form.Item name="wechat_group_name" label="群名称">
+        <Form form={chatidForm} layout="vertical">
+          <Form.Item name="wechat_group_name" label="群聊名称（RPA用）" extra="用于RPA识别目标群，如：XX客户对接群">
             <Input placeholder="如：XX客户对接群" />
           </Form.Item>
-          <Form.Item name="wechat_webhook" label="Webhook 地址" rules={[{ required: true, message: '请输入 Webhook 地址' }]}>
-            <Input.TextArea rows={4} placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxxx" />
+          <Form.Item name="wechat_webhook" label="Webhook地址（内部群用）" extra="仅内部群可用，配置后直接推送，无需RPA">
+            <Input.TextArea rows={3} placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..." />
+          </Form.Item>
+          <Form.Item name="wechat_chatid" label="群聊 ChatID（可选）">
+            <Input placeholder="wrxxxxxxxxxxxxxx" />
           </Form.Item>
         </Form>
-        <Button
-          onClick={() => {
-            const url = webhookForm.getFieldValue('wechat_webhook');
-            handleTestWebhook(url);
-          }}
-        >
-          测试发送
-        </Button>
+        <Space>
+          <Button
+            onClick={() => {
+              const chatid = chatidForm.getFieldValue('wechat_chatid');
+              handleTestSend(chatid);
+            }}
+          >
+            测试 ChatID
+          </Button>
+          <Button
+            onClick={() => {
+              const webhook = chatidForm.getFieldValue('wechat_webhook');
+              if (!webhook) { message.warning('请先填写 Webhook 地址'); return; }
+              fetch(webhook, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ msgtype: 'text', text: { content: '【美鸥物流】测试消息：Webhook 配置成功！' } }) })
+                .then(r => r.json()).then(d => {
+                  if (d.errcode === 0) message.success('Webhook 测试成功');
+                  else message.error('Webhook 测试失败: ' + d.errmsg);
+                }).catch(() => message.error('请求失败'));
+            }}
+          >
+            测试 Webhook
+          </Button>
+        </Space>
       </Modal>
     </div>
   );

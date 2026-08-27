@@ -287,6 +287,7 @@ function createTables() {
   try { db.exec('ALTER TABLE yunwuyun_customers ADD COLUMN contact_phone TEXT'); } catch (_) {}
   try { db.exec('ALTER TABLE yunwuyun_customers ADD COLUMN wechat_webhook TEXT'); } catch (_) {}
   try { db.exec('ALTER TABLE yunwuyun_customers ADD COLUMN wechat_group_name TEXT'); } catch (_) {}
+  try { db.exec('ALTER TABLE yunwuyun_customers ADD COLUMN wechat_chatid TEXT'); } catch (_) {}
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS roles (
@@ -328,7 +329,153 @@ function createTables() {
       error_msg TEXT,
       created_at TEXT NOT NULL
     );
+
+    -- RPA消息队列：CRM写入，RPA工具轮询消费
+    CREATE TABLE IF NOT EXISTS push_queue (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      client_id INTEGER,
+      client_name TEXT,
+      group_name TEXT,
+      order_ids TEXT,
+      content TEXT,
+      status TEXT DEFAULT 'pending',
+      error_msg TEXT,
+      created_at TEXT NOT NULL,
+      sent_at TEXT
+    );
+
+    -- 销售管理模块
+    CREATE TABLE IF NOT EXISTS sales_materials (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      title TEXT NOT NULL,
+      content TEXT DEFAULT '',
+      category TEXT NOT NULL DEFAULT 'product',
+      file_url TEXT,
+      author_id INTEGER REFERENCES users(id),
+      status TEXT DEFAULT 'published',
+      view_count INTEGER DEFAULT 0,
+      is_pinned INTEGER DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS sales_scripts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      title TEXT NOT NULL,
+      scene_category TEXT NOT NULL,
+      scene_name TEXT NOT NULL,
+      script_content TEXT NOT NULL,
+      notes TEXT DEFAULT '',
+      target_customer_type TEXT DEFAULT '',
+      keywords TEXT DEFAULT '',
+      file_url TEXT DEFAULT '',
+      author_id INTEGER REFERENCES users(id),
+      usage_count INTEGER DEFAULT 0,
+      status TEXT DEFAULT 'published',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS script_favorites (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      script_id INTEGER NOT NULL REFERENCES sales_scripts(id) ON DELETE CASCADE,
+      created_at TEXT NOT NULL,
+      UNIQUE(user_id, script_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS onboarding_plans (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      title TEXT NOT NULL,
+      description TEXT DEFAULT '',
+      duration_days INTEGER DEFAULT 14,
+      status TEXT DEFAULT 'active',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS onboarding_tasks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      plan_id INTEGER NOT NULL REFERENCES onboarding_plans(id) ON DELETE CASCADE,
+      day_number INTEGER NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT DEFAULT '',
+      task_type TEXT NOT NULL DEFAULT 'study',
+      material_id INTEGER REFERENCES sales_materials(id) ON DELETE SET NULL,
+      script_id INTEGER REFERENCES sales_scripts(id) ON DELETE SET NULL,
+      sort_order INTEGER DEFAULT 0,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS user_onboarding (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      plan_id INTEGER NOT NULL REFERENCES onboarding_plans(id),
+      task_id INTEGER NOT NULL REFERENCES onboarding_tasks(id) ON DELETE CASCADE,
+      status TEXT DEFAULT 'pending',
+      score INTEGER,
+      mentor_comment TEXT,
+      completed_at TEXT,
+      created_at TEXT NOT NULL,
+      UNIQUE(user_id, task_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS call_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      customer_id INTEGER REFERENCES customers(id) ON DELETE SET NULL,
+      customer_name TEXT DEFAULT '',
+      duration_minutes INTEGER DEFAULT 0,
+      scenario_id INTEGER DEFAULT 0,
+      script_id INTEGER REFERENCES sales_scripts(id) ON DELETE SET NULL,
+      content TEXT DEFAULT '',
+      customer_response TEXT DEFAULT '',
+      self_review TEXT DEFAULT '',
+      next_steps TEXT DEFAULT '',
+      file_url TEXT DEFAULT '',
+      status TEXT DEFAULT 'draft',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS call_reviews (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      call_log_id INTEGER NOT NULL REFERENCES call_logs(id) ON DELETE CASCADE,
+      reviewer_id INTEGER NOT NULL REFERENCES users(id),
+      comment TEXT NOT NULL,
+      rating INTEGER DEFAULT 0,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS feedback_summaries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      title TEXT NOT NULL,
+      content TEXT DEFAULT '',
+      related_call_ids TEXT DEFAULT '[]',
+      lessons_learned TEXT DEFAULT '',
+      action_items TEXT DEFAULT '',
+      file_url TEXT DEFAULT '',
+      status TEXT DEFAULT 'draft',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_sales_materials_category ON sales_materials(category);
+    CREATE INDEX IF NOT EXISTS idx_sales_scripts_scene ON sales_scripts(scene_category);
+    CREATE INDEX IF NOT EXISTS idx_sales_scripts_status ON sales_scripts(status);
+    CREATE INDEX IF NOT EXISTS idx_onboarding_tasks_plan ON onboarding_tasks(plan_id);
+    CREATE INDEX IF NOT EXISTS idx_user_onboarding_user ON user_onboarding(user_id);
+    CREATE INDEX IF NOT EXISTS idx_call_logs_user ON call_logs(user_id);
+    CREATE INDEX IF NOT EXISTS idx_call_logs_customer ON call_logs(customer_id);
+    CREATE INDEX IF NOT EXISTS idx_call_reviews_call ON call_reviews(call_log_id);
+
+    CREATE INDEX IF NOT EXISTS idx_feedback_summaries_user ON feedback_summaries(user_id);
   `);
+
+  try { db.exec('ALTER TABLE sales_scripts ADD COLUMN file_url TEXT DEFAULT ""'); } catch {}
+  try { db.exec('ALTER TABLE call_logs ADD COLUMN file_url TEXT DEFAULT ""'); } catch {}
+  try { db.exec('ALTER TABLE feedback_summaries ADD COLUMN file_url TEXT DEFAULT ""'); } catch {}
 }
 
 function migrateFromJSON() {
@@ -446,13 +593,13 @@ function initDefaultData() {
 
     // 管理员角色 - 所有菜单 + 所有数据权限
     const adminRole = insertRole.run('admin', '系统管理员，拥有所有权限', now);
-    const adminMenus = ['/', '/customers', '/reminders', '/daily-report', '/quotes', '/weekly-report', '/yunwuyun', '/admin'];
+    const adminMenus = ['/', '/customers', '/reminders', '/daily-report', '/quotes', '/weekly-report', '/yunwuyun', '/sales', '/admin'];
     for (const m of adminMenus) insertMenu.run(adminRole.lastInsertRowid, m);
     insertPerm.run(adminRole.lastInsertRowid, 'data:all');
 
     // 销售角色 - 部分菜单 + 只看自己数据
     const salesRole = insertRole.run('sales', '销售人员，管理自己的客户和业务', now);
-    const salesMenus = ['/', '/customers', '/reminders', '/daily-report', '/quotes', '/weekly-report'];
+    const salesMenus = ['/', '/customers', '/reminders', '/daily-report', '/quotes', '/weekly-report', '/sales'];
     for (const m of salesMenus) insertMenu.run(salesRole.lastInsertRowid, m);
     insertPerm.run(salesRole.lastInsertRowid, 'data:own');
   }
@@ -1446,7 +1593,7 @@ export const RoleOps = {
 
   getUserMenus(roleName) {
     if (roleName === 'admin') {
-      return ['/', '/customers', '/reminders', '/daily-report', '/quotes', '/weekly-report', '/yunwuyun', '/wechat', '/admin'];
+      return ['/', '/customers', '/reminders', '/daily-report', '/quotes', '/weekly-report', '/yunwuyun', '/wechat', '/sales', '/admin'];
     }
     const role = db.prepare('SELECT id FROM roles WHERE name = ?').get(roleName);
     if (!role) return [];

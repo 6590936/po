@@ -47,6 +47,8 @@ function formatDate(val) {
 function Yunwuyun() {
   const [activeTab, setActiveTab] = useState('orders');
   const [syncing, setSyncing] = useState(false);
+  const [tokenInput, setTokenInput] = useState('');
+  const [settingToken, setSettingToken] = useState(false);
 
   const [stats, setStats] = useState({
     orderCount: 0, customerCount: 0, totalAR: 0, totalAP: 0, totalProfit: 0,
@@ -165,6 +167,28 @@ function Yunwuyun() {
       message.error('同步失败: ' + err.message);
     } finally {
       setSyncing(false);
+    }
+  };
+
+  // 手动设置Token
+  const handleSetToken = async () => {
+    if (!tokenInput.trim()) {
+      message.warning('请输入Token');
+      return;
+    }
+    setSettingToken(true);
+    try {
+      const res = await yunwuyunAPI.setToken(tokenInput.trim());
+      if (res.success) {
+        message.success('Token已设置，现在可以同步了');
+        setTokenInput('');
+      } else {
+        message.error(res.error || '设置失败');
+      }
+    } catch (err) {
+      message.error('设置失败: ' + err.message);
+    } finally {
+      setSettingToken(false);
     }
   };
 
@@ -464,6 +488,16 @@ function Yunwuyun() {
         </Col>
         <Col>
           <Space>
+            <Input.Password
+              placeholder="粘贴FMS Token"
+              value={tokenInput}
+              onChange={e => setTokenInput(e.target.value)}
+              style={{ width: 280 }}
+              size="small"
+            />
+            <Button size="small" onClick={handleSetToken} loading={settingToken}>
+              设置Token
+            </Button>
             <Button
               icon={<SyncOutlined spin={syncing} />}
               onClick={() => handleSync(activeTab === 'orders' ? 'orders' : 'customers')}
@@ -852,7 +886,7 @@ function Yunwuyun() {
         onOk={handleSave}
         confirmLoading={editLoading}
         width={800}
-        destroyOnClose
+        destroyOnHidden
       >
         <Form form={form} layout="vertical" style={{ marginTop: 16 }}>
           {editType === 'order' ? (
@@ -1137,7 +1171,7 @@ function Yunwuyun() {
         confirmLoading={accountLoading}
         okText="确认"
         cancelText="取消"
-        destroyOnClose
+        destroyOnHidden
       >
         {accountModal.mode === 'disable' ? (
           <p>确认关闭客户 <strong>{accountModal.customer?.client_name}</strong> 的客户端登录权限？</p>

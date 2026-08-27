@@ -348,12 +348,12 @@ function handleLocalQuery(message, clientName) {
     if (jobNo) {
       const order = db.prepare(
         `SELECT job_no, job_date, vessel, voyage, etd, eta, dest_country, goods_name, pieces, goods_cbm, order_status,
-                container_no, seal_no, bl_no, mbl_no
-         FROM yunwuyun_orders WHERE job_no LIKE ?`
-      ).get(`%${jobNo}%`);
+                bl_no_domestic, bl_no_overseas, so_no, cnt_nos
+         FROM yunwuyun_orders WHERE job_no LIKE ? OR so_no LIKE ?`
+      ).get(`%${jobNo}%`, `%${jobNo}%`);
 
       if (order) {
-        return `【订单查询结果】\n━━━━━━━━━━━━━━━━\n工作号：${order.job_no}\n日期：${order.job_date?.slice(0, 10)}\n船名/航次：${order.vessel || '-'} / ${order.voyage || '-'}\nETD：${order.etd?.slice(0, 10) || '-'}\nETA：${order.eta?.slice(0, 10) || '-'}\n目的国：${order.dest_country || '-'}\n品名：${order.goods_name || '-'}\n件数：${order.pieces || 0}  方数：${order.goods_cbm || 0}\n柜号：${order.container_no || '-'}\n封号：${order.seal_no || '-'}\n提单号：${order.bl_no || '-'}\n状态：${order.order_status || '-'}\n━━━━━━━━━━━━━━━━\n如有疑问请联系客服`;
+        return `【订单查询结果】\n━━━━━━━━━━━━━━━━\n工作号：${order.job_no}\n日期：${order.job_date?.slice(0, 10)}\n船名/航次：${order.vessel || '-'} / ${order.voyage || '-'}\nETD：${order.etd?.slice(0, 10) || '-'}\nETA：${order.eta?.slice(0, 10) || '-'}\n目的国：${order.dest_country || '-'}\n品名：${order.goods_name || '-'}\n件数：${order.pieces || 0}  方数：${order.goods_cbm || 0}\nSO号：${order.so_no || '-'}\n箱号：${order.cnt_nos || '-'}\n提单号：${order.bl_no_domestic || order.bl_no_overseas || '-'}\n状态：${order.order_status || '-'}\n━━━━━━━━━━━━━━━━\n如有疑问请联系客服`;
       }
       return `未找到工作号 "${jobNo}" 对应的订单，请确认工作号是否正确。`;
     }
@@ -433,6 +433,7 @@ async function chatReply({ message, groupName, senderName }) {
 
 // ─── 企业微信回调：接收客户群消息 ───
 import crypto from 'crypto';
+import { handleKfCallback } from './wechat_kf.js';
 
 class WXBizMsgCrypt {
   constructor(token, encodingAESKey, corpId) {
@@ -515,6 +516,13 @@ async function handleWeworkCallback(query, body) {
   const msg = parseXmlMsg(xml);
 
   console.log('[企微回调]', msg.MsgType, msg.Content?.slice(0, 100), 'from', msg.FromUserName);
+
+  // 检测微信客服事件（kf_msg_or_event），分流到客服回调处理
+  if (msg.Event === 'kf_msg_or_event') {
+    console.log('[企微回调] 检测到微信客服事件，转交客服模块处理');
+    await handleKfCallback(query, body);
+    return '';
+  }
 
   // 只处理文本消息
   if (msg.MsgType !== 'text' || !msg.Content) {
