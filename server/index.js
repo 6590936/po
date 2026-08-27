@@ -19,7 +19,7 @@ import clientRoutes from './routes/client.js';
 import wechatRoutes from './routes/wechat.js';
 import wechatKfRoutes from './routes/wechat_kf.js';
 import botRoutes from './routes/bot.js';
-import salesRoutes from './routes/sales.js';
+import salesRoutes from './routes/sales/index.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();

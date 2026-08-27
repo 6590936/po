@@ -35,6 +35,9 @@ async function request(url, options = {}) {
       throw new Error(data.error || '请求失败');
     }
 
+    if (data && data.success === true) {
+      return data.data;
+    }
     return data;
   } catch (err) {
     throw err;

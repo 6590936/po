@@ -16,7 +16,7 @@ import ClientLogin from './pages/ClientLogin';
 import ClientPortal from './pages/ClientPortal';
 import Yunwuyun from './pages/Yunwuyun';
 import WechatPush from './pages/WechatPush';
-import SalesManagement from './pages/SalesManagement';
+import SalesManagement from './pages/sales';
 
 function App() {
   const user = useAuthStore((s) => s.user);

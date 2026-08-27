@@ -100,15 +100,13 @@ function Yunwuyun() {
   const fetchStats = useCallback(async () => {
     try {
       const res = await yunwuyunAPI.getStats();
-      if (res.success) {
-        setStats({
-          orderCount: res.orderCount || 0,
-          customerCount: res.customerCount || 0,
-          totalAR: res.totalAR || 0,
-          totalAP: res.totalAP || 0,
-          totalProfit: res.totalProfit || 0,
-        });
-      }
+      setStats({
+        orderCount: res.orderCount || 0,
+        customerCount: res.customerCount || 0,
+        totalAR: res.totalAR || 0,
+        totalAP: res.totalAP || 0,
+        totalProfit: res.totalProfit || 0,
+      });
     } catch (_) {}
   }, []);
 
@@ -118,7 +116,7 @@ function Yunwuyun() {
     setOrderLoading(true);
     try {
       const res = await yunwuyunAPI.getOrders(orderParams);
-      setOrders(res.data || []);
+      setOrders(res.list || []);
       setOrderTotal(res.total || 0);
     } catch (err) {
       message.error('获取订单失败: ' + err.message);
@@ -136,7 +134,7 @@ function Yunwuyun() {
         search: custParams.search,
         inuse: custParams.inuse,
       });
-      setCustomers(res.data || []);
+      setCustomers(res.list || []);
       setCustTotal(res.total || 0);
     } catch (err) {
       message.error('获取客户失败: ' + err.message);
@@ -155,13 +153,13 @@ function Yunwuyun() {
     try {
       const fn = type === 'orders' ? yunwuyunAPI.syncOrders : yunwuyunAPI.syncCustomers;
       const res = await fn();
-      if (res.success) {
+      if (res.totalSynced || res.total) {
         message.success(`同步完成: ${res.totalSynced || res.total} 条`);
         fetchStats();
         if (type === 'orders') fetchOrders();
         else fetchCustomers();
       } else {
-        message.error(res.error || '同步失败');
+        message.error('同步失败');
       }
     } catch (err) {
       message.error('同步失败: ' + err.message);
@@ -179,8 +177,8 @@ function Yunwuyun() {
     setSettingToken(true);
     try {
       const res = await yunwuyunAPI.setToken(tokenInput.trim());
-      if (res.success) {
-        message.success('Token已设置，现在可以同步了');
+      if (res.message) {
+        message.success(res.message);
         setTokenInput('');
       } else {
         message.error(res.error || '设置失败');
@@ -197,12 +195,12 @@ function Yunwuyun() {
     try {
       const fn = type === 'order' ? yunwuyunAPI.getOrderDetail : yunwuyunAPI.getCustomerDetail;
       const res = await fn(id);
-      if (res.success) {
+      if (res) {
         setDetailType(type);
-        setDetailData(res.data);
+        setDetailData(res);
         setDetailVisible(true);
       } else {
-        message.error(res.error || '获取详情失败');
+        message.error('获取详情失败');
       }
     } catch (err) {
       message.error('获取详情失败: ' + err.message);
@@ -304,7 +302,7 @@ function Yunwuyun() {
       } else {
         res = await yunwuyunAPI.resetCustomerPassword(id, accountPwd);
       }
-      if (res.success) {
+      if (res.message) {
         message.success(res.message);
         setAccountModal({ visible: false, customer: null, mode: '' });
         fetchCustomers();
@@ -322,14 +320,10 @@ function Yunwuyun() {
     try {
       const fn = type === 'order' ? yunwuyunAPI.deleteOrder : yunwuyunAPI.deleteCustomer;
       const res = await fn(id);
-      if (res.success) {
-        message.success('删除成功');
-        if (type === 'order') fetchOrders();
-        else fetchCustomers();
-        fetchStats();
-      } else {
-        message.error(res.error || '删除失败');
-      }
+      message.success('删除成功');
+      if (type === 'order') fetchOrders();
+      else fetchCustomers();
+      fetchStats();
     } catch (err) {
       message.error('删除失败: ' + err.message);
     }

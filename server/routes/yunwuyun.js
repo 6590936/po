@@ -23,7 +23,7 @@ router.get('/test', async (req, res) => {
 router.post('/set-token', async (req, res) => {
   try {
     setToken(req.body.token);
-    res.json({ success: true, message: 'Token已更新' });
+    res.json({ success: true, data: { message: 'Token已更新' } });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -85,7 +85,7 @@ router.post('/sync-orders', async (req, res) => {
     });
     syncAll();
 
-    res.json({ success: true, totalSynced: result.totalSynced, total: result.total });
+    res.json({ success: true, data: { totalSynced: result.totalSynced, total: result.total } });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -133,7 +133,7 @@ router.post('/sync-customers', async (req, res) => {
     });
     syncAll();
 
-    res.json({ success: true, totalSynced: result.totalSynced, total: result.total });
+    res.json({ success: true, data: { totalSynced: result.totalSynced, total: result.total } });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -162,7 +162,7 @@ router.get('/orders', async (req, res) => {
 
     const total = db.prepare(`SELECT COUNT(*) as cnt FROM yunwuyun_orders WHERE ${where}`).get(...params).cnt;
     const rows = db.prepare(`SELECT * FROM yunwuyun_orders WHERE ${where} ORDER BY job_date DESC LIMIT ? OFFSET ?`).all(...params, size, offset);
-    res.json({ success: true, data: rows, total, page, size });
+    res.json({ success: true, data: { list: rows, total, page, size } });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -197,7 +197,7 @@ router.get('/customers', async (req, res) => {
 
     const total = db.prepare(`SELECT COUNT(*) as cnt FROM yunwuyun_customers WHERE ${where}`).get(...params).cnt;
     const rows = db.prepare(`SELECT * FROM yunwuyun_customers WHERE ${where} ORDER BY client_name LIMIT ? OFFSET ?`).all(...params, size, offset);
-    res.json({ success: true, data: rows, total, page, size });
+    res.json({ success: true, data: { list: rows, total, page, size } });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -219,7 +219,7 @@ router.get('/customers/filters', async (req, res) => {
     const countryNames = db.prepare(
       'SELECT DISTINCT country_name FROM yunwuyun_customers WHERE country_name IS NOT NULL AND country_name != \'\' ORDER BY country_name'
     ).all().map(r => r.country_name);
-    res.json({ success: true, clientTypes, clientClasses, salesNames, countryNames });
+    res.json({ success: true, data: { clientTypes, clientClasses, salesNames, countryNames } });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -235,12 +235,14 @@ router.get('/stats', async (req, res) => {
     const statusCounts = db.prepare('SELECT order_status, COUNT(*) as cnt FROM yunwuyun_orders GROUP BY order_status').all();
     res.json({
       success: true,
-      orderCount,
-      customerCount,
-      totalAR: totals.total_ar || 0,
-      totalAP: totals.total_ap || 0,
-      totalProfit: totals.total_profit || 0,
-      statusCounts,
+      data: {
+        orderCount,
+        customerCount,
+        totalAR: totals.total_ar || 0,
+        totalAP: totals.total_ap || 0,
+        totalProfit: totals.total_profit || 0,
+        statusCounts,
+      },
     });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -312,7 +314,7 @@ router.put('/orders/:id', async (req, res) => {
     if (sets.length === 0) return res.json({ success: false, error: '无更新字段' });
     vals.push(req.params.id);
     db.prepare(`UPDATE yunwuyun_orders SET ${sets.join(', ')} WHERE job_id = ?`).run(...vals);
-    res.json({ success: true });
+    res.json({ success: true, data: {} });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -325,7 +327,7 @@ router.delete('/orders/:id', async (req, res) => {
     const existing = db.prepare('SELECT * FROM yunwuyun_orders WHERE job_id = ?').get(req.params.id);
     if (!existing) return res.status(404).json({ success: false, error: '订单不存在' });
     db.prepare('DELETE FROM yunwuyun_orders WHERE job_id = ?').run(req.params.id);
-    res.json({ success: true });
+    res.json({ success: true, data: {} });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -414,7 +416,7 @@ router.put('/customers/:id', async (req, res) => {
     if (sets.length === 0) return res.json({ success: false, error: '无更新字段' });
     vals.push(req.params.id);
     db.prepare(`UPDATE yunwuyun_customers SET ${sets.join(', ')} WHERE client_id = ?`).run(...vals);
-    res.json({ success: true });
+    res.json({ success: true, data: {} });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -427,7 +429,7 @@ router.delete('/customers/:id', async (req, res) => {
     const existing = db.prepare('SELECT * FROM yunwuyun_customers WHERE client_id = ?').get(req.params.id);
     if (!existing) return res.status(404).json({ success: false, error: '客户不存在' });
     db.prepare('DELETE FROM yunwuyun_customers WHERE client_id = ?').run(req.params.id);
-    res.json({ success: true });
+    res.json({ success: true, data: {} });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -497,7 +499,7 @@ router.put('/customers/:id/enable-login', async (req, res) => {
     const hashed = bcrypt.hashSync(password, 10);
     db.prepare('UPDATE yunwuyun_customers SET login_enabled = 1, login_account = ?, login_password = ? WHERE client_id = ?')
       .run(login_account, hashed, parseInt(req.params.id));
-    res.json({ success: true, message: '客户登录已开通' });
+    res.json({ success: true, data: { message: '客户登录已开通' } });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -509,7 +511,7 @@ router.put('/customers/:id/disable-login', async (req, res) => {
     const db = getDb();
     db.prepare('UPDATE yunwuyun_customers SET login_enabled = 0, login_account = NULL, login_password = NULL WHERE client_id = ?')
       .run(parseInt(req.params.id));
-    res.json({ success: true, message: '客户登录已关闭' });
+    res.json({ success: true, data: { message: '客户登录已关闭' } });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -531,7 +533,7 @@ router.put('/customers/:id/reset-password', async (req, res) => {
     const hashed = bcrypt.hashSync(password, 10);
     db.prepare('UPDATE yunwuyun_customers SET login_password = ? WHERE client_id = ?')
       .run(hashed, parseInt(req.params.id));
-    res.json({ success: true, message: '密码重置成功' });
+    res.json({ success: true, data: { message: '密码重置成功' } });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
