@@ -15,6 +15,7 @@ import {
   CloudSyncOutlined,
   WechatOutlined,
   ShopOutlined,
+  EnvironmentOutlined,
 } from '@ant-design/icons';
 import { useNavigate, useLocation } from 'react-router-dom';
 import useAuthStore from '../store/authStore';
@@ -71,6 +72,11 @@ function LayoutWrapper({ children }) {
       key: '/yunwuyun',
       icon: <CloudSyncOutlined />,
       label: 'FMS数据同步',
+    },
+    {
+      key: '/tracking',
+      icon: <EnvironmentOutlined />,
+      label: '轨迹查验',
     },
     {
       key: '/wechat',

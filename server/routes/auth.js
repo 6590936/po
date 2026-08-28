@@ -50,7 +50,15 @@ router.post('/login', (req, res) => {
 router.get('/me', authenticateToken, (req, res) => {
   const user = UserOps.findById(req.user.id);
   if (!user) return res.status(404).json({ error: '用户不存在' });
-  res.json({ id: user.id, username: user.username, name: user.name, role: user.role, created_at: user.created_at });
+  res.json({
+    id: user.id,
+    username: user.username,
+    name: user.name,
+    role: user.role,
+    created_at: user.created_at,
+    menus: RoleOps.getUserMenus(user.role),
+    permissions: RoleOps.getUserPermissions(user.role),
+  });
 });
 
 // 获取所有用户列表（管理员）

@@ -12,6 +12,7 @@ const ALL_MENUS = [
   { key: '/quotes', label: '报价管理' },
   { key: '/weekly-report', label: '周报' },
   { key: '/yunwuyun', label: 'FMS数据同步' },
+  { key: '/tracking', label: '轨迹查验' },
   { key: '/wechat', label: '企业微信推送' },
   { key: '/sales', label: '销售管理' },
   { key: '/admin', label: '系统管理' },

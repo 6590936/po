@@ -344,6 +344,49 @@ function createTables() {
       sent_at TEXT
     );
 
+    -- 轨迹查验模块
+    CREATE TABLE IF NOT EXISTS tracking_queries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER REFERENCES users(id),
+      tracking_no TEXT NOT NULL,
+      carrier_code TEXT,
+      carrier_name TEXT,
+      latest_status TEXT,
+      query_time TEXT NOT NULL,
+      success INTEGER DEFAULT 1,
+      error_msg TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_tracking_queries_user ON tracking_queries(user_id);
+    CREATE INDEX IF NOT EXISTS idx_tracking_queries_no ON tracking_queries(tracking_no);
+
+    -- 订单轨迹表（FMS订单抓取的轨迹数据）
+    CREATE TABLE IF NOT EXISTS order_tracking (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      job_id INTEGER NOT NULL,
+      tracking_no TEXT,
+      carrier_code TEXT,
+      carrier_name TEXT,
+      origin TEXT,
+      destination TEXT,
+      vessel TEXT,
+      voyage TEXT,
+      container_no TEXT,
+      etd TEXT,
+      atd TEXT,
+      eta TEXT,
+      ata TEXT,
+      status TEXT,
+      status_label TEXT,
+      timeline TEXT,
+      raw_data TEXT,
+      queried_at TEXT,
+      success INTEGER DEFAULT 0,
+      error_msg TEXT,
+      UNIQUE(job_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_order_tracking_job ON order_tracking(job_id);
+    CREATE INDEX IF NOT EXISTS idx_order_tracking_status ON order_tracking(status);
+
     -- 销售管理模块
     CREATE TABLE IF NOT EXISTS sales_materials (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -593,13 +636,13 @@ function initDefaultData() {
 
     // 管理员角色 - 所有菜单 + 所有数据权限
     const adminRole = insertRole.run('admin', '系统管理员，拥有所有权限', now);
-    const adminMenus = ['/', '/customers', '/reminders', '/daily-report', '/quotes', '/weekly-report', '/yunwuyun', '/sales', '/admin'];
+    const adminMenus = ['/', '/customers', '/reminders', '/daily-report', '/quotes', '/weekly-report', '/yunwuyun', '/tracking', '/sales', '/admin'];
     for (const m of adminMenus) insertMenu.run(adminRole.lastInsertRowid, m);
     insertPerm.run(adminRole.lastInsertRowid, 'data:all');
 
     // 销售角色 - 部分菜单 + 只看自己数据
     const salesRole = insertRole.run('sales', '销售人员，管理自己的客户和业务', now);
-    const salesMenus = ['/', '/customers', '/reminders', '/daily-report', '/quotes', '/weekly-report', '/sales'];
+    const salesMenus = ['/', '/customers', '/reminders', '/daily-report', '/quotes', '/weekly-report', '/tracking', '/sales'];
     for (const m of salesMenus) insertMenu.run(salesRole.lastInsertRowid, m);
     insertPerm.run(salesRole.lastInsertRowid, 'data:own');
   }
@@ -613,6 +656,18 @@ function initDefaultData() {
     insertUser.run('admin', bcrypt.hashSync('admin123', 10), '系统管理员', 'admin', now);
     insertUser.run('sales1', bcrypt.hashSync('123456', 10), '张销售', 'sales', now);
   }
+
+  // 迁移：给已有角色补充轨迹查验菜单权限（兼容老数据库）
+  try {
+    const existingRoles = db.prepare('SELECT id, name FROM roles').all();
+    const insertMenu = db.prepare('INSERT OR IGNORE INTO role_menus (role_id, menu_key) VALUES (?, ?)');
+    for (const role of existingRoles) {
+      // admin 和 sales 角色默认添加轨迹查验菜单
+      if (role.name === 'admin' || role.name === 'sales') {
+        insertMenu.run(role.id, '/tracking');
+      }
+    }
+  } catch (_) {}
 }
 
 export function initDatabase() {
@@ -1593,7 +1648,7 @@ export const RoleOps = {
 
   getUserMenus(roleName) {
     if (roleName === 'admin') {
-      return ['/', '/customers', '/reminders', '/daily-report', '/quotes', '/weekly-report', '/yunwuyun', '/wechat', '/sales', '/admin'];
+      return ['/', '/customers', '/reminders', '/daily-report', '/quotes', '/weekly-report', '/yunwuyun', '/tracking', '/wechat', '/sales', '/admin'];
     }
     const role = db.prepare('SELECT id FROM roles WHERE name = ?').get(roleName);
     if (!role) return [];

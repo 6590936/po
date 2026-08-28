@@ -4,13 +4,15 @@ import {
   Table, Card, Input, Button, Tag, Space, Tabs, Typography,
   Row, Col, Statistic, message, Tooltip, Select, Drawer, Modal, Form,
   InputNumber, DatePicker, Popconfirm, Descriptions, Divider, Checkbox, Popover,
+  Timeline, Empty, Spin,
 } from 'antd';
 import {
   SearchOutlined, SyncOutlined, ReloadOutlined,
   DollarOutlined, FileTextOutlined, TeamOutlined, TrophyOutlined,
   PlusOutlined, EyeOutlined, EditOutlined, DeleteOutlined, SettingOutlined,
+  EnvironmentOutlined,
 } from '@ant-design/icons';
-import { yunwuyunAPI } from '../api';
+import { yunwuyunAPI, trackingAPI } from '../api';
 import dayjs from 'dayjs';
 
 const { Title, Text } = Typography;
@@ -59,6 +61,7 @@ function Yunwuyun() {
   const [orderTotal, setOrderTotal] = useState(0);
   const [orderLoading, setOrderLoading] = useState(false);
   const [orderParams, setOrderParams] = useState({ page: 1, pageSize: 20, search: '', status: '' });
+  const [fetchingJobId, setFetchingJobId] = useState(null); // 正在抓取轨迹的订单ID
 
   // 客户
   const [customers, setCustomers] = useState([]);
@@ -88,6 +91,8 @@ function Yunwuyun() {
 
   // 列设置
   const [colSettingVisible, setColSettingVisible] = useState(false);
+  // 轨迹展示弹窗
+  const [trackingModal, setTrackingModal] = useState({ visible: false, data: null, loading: false, jobId: null });
   const [orderVisibleCols, setOrderVisibleCols] = useState(() => {
     try {
       const saved = localStorage.getItem('yunwuyun_order_cols');
@@ -204,6 +209,43 @@ function Yunwuyun() {
       }
     } catch (err) {
       message.error('获取详情失败: ' + err.message);
+    }
+  };
+
+  // 抓取订单轨迹
+  const handleFetchTracking = async (jobId) => {
+    setFetchingJobId(jobId);
+    try {
+      message.loading({ content: '正在抓取轨迹数据，请稍候...', key: 'fetchTracking', duration: 0 });
+      const res = await trackingAPI.fetchOrderTracking(jobId);
+      message.destroy('fetchTracking');
+      if (res && res.success) {
+        message.success(`轨迹抓取成功，当前状态: ${res.data?.statusLabel || '未知'}`);
+      } else {
+        message.warning(res?.error || '抓取失败，可能该船公司暂不支持');
+      }
+    } catch (err) {
+      message.destroy('fetchTracking');
+      message.error('抓取失败: ' + (err.message || '未知错误'));
+    } finally {
+      setFetchingJobId(null);
+    }
+  };
+
+  // 查看已抓取的轨迹
+  const handleViewTracking = async (jobId) => {
+    setTrackingModal({ visible: true, data: null, loading: true, jobId });
+    try {
+      // request 函数在 success=true 时直接返回 data.data，所以 res 就是 tracking 对象
+      const res = await trackingAPI.getOrderTracking(jobId);
+      if (res) {
+        setTrackingModal((prev) => ({ ...prev, data: res, loading: false }));
+      } else {
+        setTrackingModal((prev) => ({ ...prev, data: null, loading: false }));
+      }
+    } catch (err) {
+      message.error('获取轨迹失败: ' + err.message);
+      setTrackingModal((prev) => ({ ...prev, loading: false }));
     }
   };
 
@@ -385,9 +427,25 @@ function Yunwuyun() {
     { key: 'inserted_by', title: '创建人', dataIndex: 'inserted_by', width: 100 },
     { key: 'job_date', title: '创建日期', dataIndex: 'job_date', width: 110,
       render: (t) => t ? dayjs(t).format('YYYY-MM-DD') : '-' },
-    { key: 'action', title: '操作', width: 180, fixed: 'right',
-      render: (_, r) => (
+    { key: 'action', title: '操作', width: 320, fixed: 'right',
+      render: (_, r) => {
+        // 选择轨迹查询单号：海外提单号 > 国内提单号 > 船东单号 > 订舱号
+        const trackNo = r.bl_no_overseas || r.bl_no_domestic || r.carrier_jobno || r.so_no || '';
+        return (
         <Space size="small">
+          {trackNo && (
+            <Tooltip title="抓取轨迹并存储到数据库">
+              <Button type="link" size="small" icon={<SyncOutlined />}
+                loading={fetchingJobId === r.job_id}
+                onClick={() => handleFetchTracking(r.job_id)}>抓轨迹</Button>
+            </Tooltip>
+          )}
+          {trackNo && (
+            <Tooltip title="查看已抓取的轨迹数据">
+              <Button type="link" size="small" icon={<EnvironmentOutlined />}
+                onClick={() => handleViewTracking(r.job_id)}>查看轨迹</Button>
+            </Tooltip>
+          )}
           <Button type="link" size="small" icon={<EyeOutlined />}
             onClick={() => handleViewDetail('order', r.job_id)}>详情</Button>
           <Button type="link" size="small" icon={<EditOutlined />}
@@ -396,7 +454,7 @@ function Yunwuyun() {
             <Button type="link" size="small" danger icon={<DeleteOutlined />}>删除</Button>
           </Popconfirm>
         </Space>
-      ),
+      );},
     },
   ];
 
@@ -1151,6 +1209,111 @@ function Yunwuyun() {
             </Row>
           )}
         </Form>
+      </Modal>
+
+      {/* 轨迹展示弹窗 */}
+      <Modal
+        title="海运轨迹详情"
+        open={trackingModal.visible}
+        onCancel={() => setTrackingModal({ visible: false, data: null, loading: false, jobId: null })}
+        footer={[
+          trackingModal.data?.success === 1 && (
+            <Button key="refresh" type="primary" icon={<SyncOutlined />}
+              loading={fetchingJobId === trackingModal.jobId}
+              onClick={() => {
+                setTrackingModal((p) => ({ ...p, visible: false }));
+                handleFetchTracking(trackingModal.jobId);
+              }}>
+              重新抓取
+            </Button>
+          ),
+          <Button key="close" onClick={() => setTrackingModal({ visible: false, data: null, loading: false, jobId: null })}>
+            关闭
+          </Button>,
+        ]}
+        width={720}
+        destroyOnHidden
+      >
+        <Spin spinning={trackingModal.loading}>
+          {!trackingModal.data ? (
+            <Empty
+              description="暂无轨迹数据，请先点击「抓轨迹」按钮抓取"
+              style={{ padding: '40px 0' }}
+            />
+          ) : trackingModal.data.success === 0 ? (
+            <div style={{ padding: '40px 0', textAlign: 'center' }}>
+              <Tag color="red" style={{ fontSize: 14, padding: '4px 12px' }}>抓取失败</Tag>
+              <p style={{ marginTop: 16, color: '#999' }}>{trackingModal.data.error_msg || '未知错误'}</p>
+              <p style={{ color: '#666' }}>请点击「重新抓取」重试，或检查调试模式 Chrome 是否在运行</p>
+            </div>
+          ) : (
+            <>
+              {/* 基本信息 */}
+              <Descriptions column={2} size="small" bordered style={{ marginBottom: 24 }}>
+                <Descriptions.Item label="提单号">
+                  <Text strong>{trackingModal.data.tracking_no || '-'}</Text>
+                </Descriptions.Item>
+                <Descriptions.Item label="船公司">
+                  {trackingModal.data.carrier_name || '-'}
+                </Descriptions.Item>
+                <Descriptions.Item label="起运港">
+                  <Tag color="blue">{trackingModal.data.origin || '-'}</Tag>
+                </Descriptions.Item>
+                <Descriptions.Item label="目的港">
+                  <Tag color="green">{trackingModal.data.destination || '-'}</Tag>
+                </Descriptions.Item>
+                <Descriptions.Item label="箱号">
+                  {trackingModal.data.container_no || '-'}
+                </Descriptions.Item>
+                <Descriptions.Item label="预计到港(ETA)">
+                  <Text style={{ color: '#1677ff' }}>{trackingModal.data.eta || '-'}</Text>
+                </Descriptions.Item>
+                <Descriptions.Item label="当前状态">
+                  <Tag color="geekblue">{trackingModal.data.status_label || trackingModal.data.status || '-'}</Tag>
+                </Descriptions.Item>
+                <Descriptions.Item label="最后查询">
+                  {trackingModal.data.queried_at ? dayjs(trackingModal.data.queried_at).format('YYYY-MM-DD HH:mm:ss') : '-'}
+                </Descriptions.Item>
+              </Descriptions>
+
+              {/* 轨迹时间线 */}
+              <Divider orientation="left" style={{ marginBottom: 16 }}>
+                <Text strong>运输轨迹</Text>
+              </Divider>
+              {(() => {
+                const timeline = trackingModal.data.timeline
+                  ? (typeof trackingModal.data.timeline === 'string'
+                      ? JSON.parse(trackingModal.data.timeline)
+                      : trackingModal.data.timeline)
+                  : [];
+                if (!timeline || timeline.length === 0) {
+                  return <Empty description="暂无轨迹节点" style={{ padding: '20px 0' }} />;
+                }
+                return (
+                  <Timeline
+                    mode="left"
+                    style={{ paddingLeft: 8 }}
+                    items={timeline.map((evt, idx) => ({
+                      color: idx === timeline.length - 1 ? 'green' : 'blue',
+                      children: (
+                        <div style={{ paddingBottom: idx === timeline.length - 1 ? 0 : 8 }}>
+                          <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 4 }}>
+                            {evt.description || evt.status_label || evt.event || '未知事件'}
+                            {evt.is_estimated && <Tag color="orange" style={{ marginLeft: 8, fontSize: 11 }}>预计</Tag>}
+                          </div>
+                          <div style={{ color: '#666', fontSize: 13 }}>
+                            {evt.time || evt.event_time || '时间未知'}
+                            {evt.location && <span style={{ marginLeft: 12 }}>📍 {evt.location}</span>}
+                          </div>
+                        </div>
+                      ),
+                    }))}
+                  />
+                );
+              })()}
+            </>
+          )}
+        </Spin>
       </Modal>
 
       {/* 客户账号管理弹窗 */}

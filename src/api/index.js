@@ -280,3 +280,18 @@ export const salesAPI = {
   // 看板
   getSalesDashboard: () => request('/sales/dashboard'),
 };
+
+// 轨迹查验
+export const trackingAPI = {
+  getCarriers: () => request('/tracking/carriers'),
+  query: (data) => request('/tracking/query', { method: 'POST', body: JSON.stringify(data) }),
+  getHistory: (params = {}) => { const query = new URLSearchParams(params).toString(); return request(`/tracking/history?${query}`); },
+  deleteHistory: (id) => request(`/tracking/history/${id}`, { method: 'DELETE' }),
+  clearHistory: () => request('/tracking/history', { method: 'DELETE' }),
+  getStats: () => request('/tracking/stats'),
+  // 订单轨迹
+  getOrderTracking: (jobId) => request(`/tracking/order/${jobId}`),
+  fetchOrderTracking: (jobId) => request(`/tracking/order/${jobId}`, { method: 'POST' }),
+  batchFetchTracking: (jobIds) => request('/tracking/order/batch', { method: 'POST', body: JSON.stringify({ jobIds }) }),
+  getTrackingOrders: (params = {}) => { const query = new URLSearchParams(params).toString(); return request(`/tracking/orders?${query}`); },
+};

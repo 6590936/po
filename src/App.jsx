@@ -17,6 +17,7 @@ import ClientPortal from './pages/ClientPortal';
 import Yunwuyun from './pages/Yunwuyun';
 import WechatPush from './pages/WechatPush';
 import SalesManagement from './pages/sales';
+import Tracking from '../trajectory/Tracking.jsx';
 
 function App() {
   const user = useAuthStore((s) => s.user);
@@ -87,6 +88,11 @@ function App() {
           <Route path="/sales" element={
             <LayoutWrapper>
               <SalesManagement />
+            </LayoutWrapper>
+          } />
+          <Route path="/tracking" element={
+            <LayoutWrapper>
+              <Tracking />
             </LayoutWrapper>
           } />
         </>
