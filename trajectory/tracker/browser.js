@@ -164,15 +164,20 @@ class BrowserManager {
       '--disable-gpu',
       '--disable-http2',
     ];
-    const proxyServer = process.env.PLAYWRIGHT_PROXY_SERVER;
-    if (proxyServer) {
-      args.push(`--proxy-server=${proxyServer}`);
-      console.log('[浏览器管理器] 使用代理:', proxyServer);
-    }
-    this.browser = await c.launch({
+    const launchOpts = {
       headless: true,
       args,
-    });
+    };
+    const proxyServer = process.env.PLAYWRIGHT_PROXY_SERVER;
+    if (proxyServer) {
+      launchOpts.proxy = { server: proxyServer };
+      if (process.env.PLAYWRIGHT_PROXY_USERNAME) {
+        launchOpts.proxy.username = process.env.PLAYWRIGHT_PROXY_USERNAME;
+        launchOpts.proxy.password = process.env.PLAYWRIGHT_PROXY_PASSWORD || '';
+      }
+      console.log('[浏览器管理器] 使用代理:', proxyServer);
+    }
+    this.browser = await c.launch(launchOpts);
     console.log('[浏览器管理器] Headless Chromium 已启动');
     return this.browser;
   }

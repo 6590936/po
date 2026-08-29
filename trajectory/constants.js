@@ -171,21 +171,21 @@ export function matchCarrierCode(carrierName) {
   }
   // 常见别名匹配
   const aliases = {
-    '马士基': 'MSK', '马士基航运': 'MSK', 'maersk': 'MSK',
-    '地中海': 'MSC', '地中海航运': 'MSC',
-    '中远': 'COSCO', '中远海运': 'COSCO', 'cosco': 'COSCO',
-    '达飞': 'CMA', '达飞轮船': 'CMA', 'cma': 'CMA', 'cma cgm': 'CMA',
-    '赫伯罗特': 'HPL', 'hapag': 'HPL', 'hapag-lloyd': 'HPL',
-    '海洋网联': 'ONE', 'one line': 'ONE',
-    '长荣': 'EMC', '长荣海运': 'EMC', 'evergreen': 'EMC',
-    '阳明': 'YML', '阳明海运': 'YML', 'yang ming': 'YML',
-    '现代': 'HMM', '现代商船': 'HMM',
-    '以星': 'ZIM', '以星轮船': 'ZIM',
+    '马士基': 'MSK', '马士基航运': 'MSK', 'maersk': 'MSK', 'maersk line': 'MSK',
+    '地中海': 'MSC', '地中海航运': 'MSC', 'msc': 'MSC', 'mediterranean': 'MSC',
+    '中远': 'COSCO', '中远海运': 'COSCO', 'cosco': 'COSCO', 'cosco shipping': 'COSCO',
+    '达飞': 'CMA', '达飞轮船': 'CMA', 'cma': 'CMA', 'cma cgm': 'CMA', 'cma-cgm': 'CMA',
+    '赫伯罗特': 'HPL', 'hapag': 'HPL', 'hapag-lloyd': 'HPL', 'hpl': 'HPL',
+    '海洋网联': 'ONE', 'one line': 'ONE', 'one ocean': 'ONE',
+    '长荣': 'EMC', '长荣海运': 'EMC', 'evergreen': 'EMC', 'emc': 'EMC',
+    '阳明': 'YML', '阳明海运': 'YML', 'yang ming': 'YML', 'yml': 'YML',
+    '现代': 'HMM', '现代商船': 'HMM', 'hmm': 'HMM', 'hyundai': 'HMM',
+    '以星': 'ZIM', '以星轮船': 'ZIM', 'zim': 'ZIM',
     '东方海外': 'OOCL', 'oocl': 'OOCL',
-    '太平': 'PIL', '太平船务': 'PIL',
-    '万海': 'WHL', '万海航运': 'WHL', 'wan hai': 'WHL',
-    '海丰': 'SITC', '海丰国际': 'SITC',
-    '高丽': 'KMTC', '高丽海运': 'KMTC',
+    '太平': 'PIL', '太平船务': 'PIL', 'pil': 'PIL', 'pacific': 'PIL',
+    '万海': 'WHL', '万海航运': 'WHL', 'wan hai': 'WHL', 'whl': 'WHL',
+    '海丰': 'SITC', '海丰国际': 'SITC', 'sitc': 'SITC',
+    '高丽': 'KMTC', '高丽海运': 'KMTC', '韩国高丽': 'KMTC', 'kmtc': 'KMTC', 'korea': 'KMTC',
   };
   return aliases[name] || null;
 }

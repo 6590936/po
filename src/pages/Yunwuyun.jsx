@@ -10,7 +10,7 @@ import {
   SearchOutlined, SyncOutlined, ReloadOutlined,
   DollarOutlined, FileTextOutlined, TeamOutlined, TrophyOutlined,
   PlusOutlined, EyeOutlined, EditOutlined, DeleteOutlined, SettingOutlined,
-  EnvironmentOutlined,
+  EnvironmentOutlined, CheckCircleFilled, ClockCircleFilled,
 } from '@ant-design/icons';
 import { yunwuyunAPI, trackingAPI } from '../api';
 import dayjs from 'dayjs';
@@ -385,6 +385,15 @@ function Yunwuyun() {
       render: (t) => t || '-' },
     { key: 'vessel', title: '船名', dataIndex: 'vessel', width: 150, ellipsis: true },
     { key: 'voyage', title: '航次', dataIndex: 'voyage', width: 80 },
+    { key: 'tracking_status_col', title: '轨迹状态', width: 90,
+      render: (_, r) => {
+        const trackNo = r.bl_no_overseas || r.bl_no_domestic || r.carrier_jobno || r.so_no || '';
+        if (!trackNo) return <Tag color="default">无单号</Tag>;
+        if (r.has_tracking === 1) {
+          return <Tag color="success" icon={<CheckCircleFilled />}>已抓取</Tag>;
+        }
+        return <Tag color="default" icon={<ClockCircleFilled />}>未抓取</Tag>;
+      }},
     { key: 'etd', title: 'ETD', dataIndex: 'etd', width: 110,
       render: (t) => t ? dayjs(t).format('YYYY-MM-DD') : '-' },
     { key: 'eta', title: 'ETA', dataIndex: 'eta', width: 110,
@@ -431,16 +440,18 @@ function Yunwuyun() {
       render: (_, r) => {
         // 选择轨迹查询单号：海外提单号 > 国内提单号 > 船东单号 > 订舱号
         const trackNo = r.bl_no_overseas || r.bl_no_domestic || r.carrier_jobno || r.so_no || '';
+        const hasTracking = r.has_tracking === 1;
         return (
         <Space size="small">
           {trackNo && (
-            <Tooltip title="抓取轨迹并存储到数据库">
+            <Tooltip title={hasTracking ? '重新抓取轨迹数据' : '抓取轨迹并存储到数据库'}>
               <Button type="link" size="small" icon={<SyncOutlined />}
                 loading={fetchingJobId === r.job_id}
-                onClick={() => handleFetchTracking(r.job_id)}>抓轨迹</Button>
+                style={hasTracking ? { color: '#52c41a' } : {}}
+                onClick={() => handleFetchTracking(r.job_id)}>{hasTracking ? '重抓' : '抓轨迹'}</Button>
             </Tooltip>
           )}
-          {trackNo && (
+          {trackNo && hasTracking && (
             <Tooltip title="查看已抓取的轨迹数据">
               <Button type="link" size="small" icon={<EnvironmentOutlined />}
                 onClick={() => handleViewTracking(r.job_id)}>查看轨迹</Button>

@@ -161,7 +161,13 @@ router.get('/orders', async (req, res) => {
     }
 
     const total = db.prepare(`SELECT COUNT(*) as cnt FROM yunwuyun_orders WHERE ${where}`).get(...params).cnt;
-    const rows = db.prepare(`SELECT * FROM yunwuyun_orders WHERE ${where} ORDER BY job_date DESC LIMIT ? OFFSET ?`).all(...params, size, offset);
+    const rows = db.prepare(`
+      SELECT o.*, t.success AS has_tracking, t.status AS tracking_status, t.status_label AS tracking_status_label
+      FROM yunwuyun_orders o
+      LEFT JOIN order_tracking t ON o.job_id = t.job_id
+      WHERE ${where}
+      ORDER BY o.job_date DESC LIMIT ? OFFSET ?
+    `).all(...params, size, offset);
     res.json({ success: true, data: { list: rows, total, page, size } });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
