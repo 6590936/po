@@ -288,6 +288,8 @@ function createTables() {
   try { db.exec('ALTER TABLE yunwuyun_customers ADD COLUMN wechat_webhook TEXT'); } catch (_) {}
   try { db.exec('ALTER TABLE yunwuyun_customers ADD COLUMN wechat_group_name TEXT'); } catch (_) {}
   try { db.exec('ALTER TABLE yunwuyun_customers ADD COLUMN wechat_chatid TEXT'); } catch (_) {}
+  try { db.exec('ALTER TABLE yunwuyun_customers ADD COLUMN wechat_id TEXT'); } catch (_) {}
+  try { db.exec('CREATE INDEX IF NOT EXISTS idx_yy_customers_wechat_id ON yunwuyun_customers(wechat_id)'); } catch (_) {}
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS roles (

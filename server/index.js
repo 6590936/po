@@ -19,6 +19,7 @@ import clientRoutes from './routes/client.js';
 import wechatRoutes from './routes/wechat.js';
 import wechatKfRoutes from './routes/wechat_kf.js';
 import botRoutes from './routes/bot.js';
+import wcfBotRoutes from './routes/wcf-bot.js';
 import salesRoutes from './routes/sales/index.js';
 import trackingRoutes from '../trajectory/tracking.js';
 
@@ -49,6 +50,7 @@ app.use('/api/wechat', wechatRoutes);
 app.use('/rpa', botRoutes);
 app.use('/api/sales', salesRoutes);
 app.use('/api/tracking', trackingRoutes);
+app.use('/api/bot/wcf', wcfBotRoutes);
 
 // 上传文件静态服务（支持直接打开/预览）
 app.use('/api/uploads', express.static(path.join(__dirname, 'uploads'), {

@@ -1193,6 +1193,11 @@ function Yunwuyun() {
                 </Form.Item>
               </Col>
               <Col span={12}>
+                <Form.Item name="wechat_id" label="绑定微信号" tooltip="客户个人微信号ID（wxid_xxx），用于微信机器人自动识别客户">
+                  <Input placeholder="例如：wxid_abc123" />
+                </Form.Item>
+              </Col>
+              <Col span={12}>
                 <Form.Item name="country_name" label="国家">
                   <Input />
                 </Form.Item>

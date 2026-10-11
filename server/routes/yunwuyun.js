@@ -410,7 +410,8 @@ router.put('/customers/:id', async (req, res) => {
       'country_name_eng','province_state','client_addr','addr_postcode','mobile_no','office_tel','uni_credit_code',
       'contact_name','sales_name','op_name','cs_name','staff_name_biz','insert_time','update_time','inserted_by',
       'updated_by','inuse','catalog_name','catalog_name_eng','org_code','org_name','org_name_eng',
-      'client_source_name','client_source_name_eng','settler_type','csm_staff'];
+      'client_source_name','client_source_name_eng','settler_type','csm_staff',
+      'wechat_id'];
     const sets = [];
     const vals = [];
     for (const key of allowed) {
