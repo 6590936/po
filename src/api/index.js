@@ -295,3 +295,28 @@ export const trackingAPI = {
   batchFetchTracking: (jobIds) => request('/tracking/order/batch', { method: 'POST', body: JSON.stringify({ jobIds }) }),
   getTrackingOrders: (params = {}) => { const query = new URLSearchParams(params).toString(); return request(`/tracking/orders?${query}`); },
 };
+
+// 海运费报价管理
+export const shippingRatesAPI = {
+  getBatches: async (params = {}) => { const query = new URLSearchParams(params).toString(); const token = useAuthStore.getState().token; const resp = await fetch(`/api/shipping-rates/batches?${query}`, { headers: { Authorization: `Bearer ${token}` } }); const json = await resp.json(); if (!resp.ok) throw new Error(json.error); return json.data; },
+  getBatch: (id) => request(`/shipping-rates/batches/${id}`),
+  createBatch: (data) => request('/shipping-rates/batches', { method: 'POST', body: JSON.stringify(data) }),
+  updateBatch: (id, data) => request(`/shipping-rates/batches/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  deleteBatch: (id) => request(`/shipping-rates/batches/${id}`, { method: 'DELETE' }),
+  updateBatchStatus: (id, status) => request(`/shipping-rates/batches/${id}/status`, { method: 'PUT', body: JSON.stringify({ status }) }),
+  getActiveRates: (params = {}) => { const query = new URLSearchParams(params).toString(); return request(`/shipping-rates/active?${query}`); },
+  getFilters: () => request('/shipping-rates/filters'),
+  importExcel: (file) => {
+    const formData = new FormData();
+    formData.append('file', file);
+    const token = useAuthStore.getState().token;
+    return fetch('/api/shipping-rates/import', { method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: formData }).then(r => r.json());
+  },
+  exportBatch: async (id) => { const token = useAuthStore.getState().token; const resp = await fetch(`/api/shipping-rates/batches/${id}/export`, { headers: { Authorization: `Bearer ${token}` } }); const blob = await resp.blob(); const disp = resp.headers.get('Content-Disposition') || ''; const match = disp.match(/filename="?(.+?)"?$/); const filename = match ? match[1] : '报价导出.xlsx'; const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = filename; a.click(); URL.revokeObjectURL(url); },
+  generateQuotation: async (id, itemId) => { const token = useAuthStore.getState().token; const url = itemId ? `/api/shipping-rates/batches/${id}/quotation?item_id=${itemId}` : `/api/shipping-rates/batches/${id}/quotation`; const resp = await fetch(url, { headers: { Authorization: `Bearer ${token}` } }); if (!resp.ok) { const json = await resp.json(); throw new Error(json.error || '生成失败'); } const blob = await resp.blob(); const url2 = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url2; a.download = '报价单.xlsx'; a.click(); URL.revokeObjectURL(url2); },
+  getQuotationPreview: (id, itemId) => request(`/shipping-rates/batches/${id}/quotation-preview${itemId ? '?item_id=' + itemId : ''}`),
+  downloadTemplate: async () => { const token = useAuthStore.getState().token; const resp = await fetch('/api/shipping-rates/template', { headers: { Authorization: `Bearer ${token}` } }); const blob = await resp.blob(); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = '海运费报价导入模板.xlsx'; a.click(); URL.revokeObjectURL(url); },
+  getSuppliers: () => request('/shipping-rates/suppliers'),
+  createSupplier: (data) => request('/shipping-rates/suppliers', { method: 'POST', body: JSON.stringify(data) }),
+  deleteSupplier: (id) => request(`/shipping-rates/suppliers/${id}`, { method: 'DELETE' }),
+};

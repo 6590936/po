@@ -18,6 +18,7 @@ import Yunwuyun from './pages/Yunwuyun';
 import WechatPush from './pages/WechatPush';
 import SalesManagement from './pages/SalesManagement';
 import Tracking from '../trajectory/Tracking.jsx';
+import ShippingRates from './pages/ShippingRates';
 
 function App() {
   const user = useAuthStore((s) => s.user);
@@ -93,6 +94,11 @@ function App() {
           <Route path="/tracking" element={
             <LayoutWrapper>
               <Tracking />
+            </LayoutWrapper>
+          } />
+          <Route path="/shipping-rates" element={
+            <LayoutWrapper>
+              <ShippingRates />
             </LayoutWrapper>
           } />
         </>

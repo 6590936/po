@@ -16,6 +16,7 @@ import {
   WechatOutlined,
   ShopOutlined,
   EnvironmentOutlined,
+  DollarOutlined,
 } from '@ant-design/icons';
 import { useNavigate, useLocation } from 'react-router-dom';
 import useAuthStore from '../store/authStore';
@@ -77,6 +78,11 @@ function LayoutWrapper({ children }) {
       key: '/tracking',
       icon: <EnvironmentOutlined />,
       label: '轨迹查验',
+    },
+    {
+      key: '/shipping-rates',
+      icon: <DollarOutlined />,
+      label: '海运费报价',
     },
     {
       key: '/wechat',

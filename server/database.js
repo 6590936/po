@@ -516,11 +516,60 @@ function createTables() {
     CREATE INDEX IF NOT EXISTS idx_call_reviews_call ON call_reviews(call_log_id);
 
     CREATE INDEX IF NOT EXISTS idx_feedback_summaries_user ON feedback_summaries(user_id);
+
+    CREATE TABLE IF NOT EXISTS shipping_rate_batches (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      pol TEXT NOT NULL,
+      pod TEXT NOT NULL,
+      container_type TEXT NOT NULL,
+      valid_from TEXT NOT NULL,
+      valid_to TEXT NOT NULL,
+      notes TEXT DEFAULT '',
+      status TEXT DEFAULT 'active',
+      created_by INTEGER REFERENCES users(id),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_rate_batches_pol ON shipping_rate_batches(pol);
+    CREATE INDEX IF NOT EXISTS idx_rate_batches_pod ON shipping_rate_batches(pod);
+    CREATE INDEX IF NOT EXISTS idx_rate_batches_status ON shipping_rate_batches(status);
+
+    CREATE TABLE IF NOT EXISTS shipping_rate_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      batch_id INTEGER NOT NULL REFERENCES shipping_rate_batches(id) ON DELETE CASCADE,
+      carrier_name TEXT NOT NULL,
+      vessel_voyage TEXT DEFAULT '',
+      freight_rate REAL DEFAULT 0,
+      transit_days TEXT DEFAULT '',
+      supplier_name TEXT DEFAULT '',
+      supplier_contact TEXT DEFAULT '',
+      remarks TEXT DEFAULT '',
+      sort_order INTEGER DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_rate_items_batch ON shipping_rate_items(batch_id);
+
+    CREATE TABLE IF NOT EXISTS shipping_rate_suppliers (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      contact_person TEXT DEFAULT '',
+      contact_phone TEXT DEFAULT '',
+      remark TEXT DEFAULT '',
+      created_at TEXT NOT NULL
+    );
   `);
 
   try { db.exec('ALTER TABLE sales_scripts ADD COLUMN file_url TEXT DEFAULT ""'); } catch {}
   try { db.exec('ALTER TABLE call_logs ADD COLUMN file_url TEXT DEFAULT ""'); } catch {}
   try { db.exec('ALTER TABLE feedback_summaries ADD COLUMN file_url TEXT DEFAULT ""'); } catch {}
+  try { db.exec("ALTER TABLE shipping_rate_items ADD COLUMN transit_days TEXT DEFAULT ''"); } catch {}
+
+  try {
+    const roles = db.prepare('SELECT id FROM roles').all();
+    const insertMenu = db.prepare('INSERT OR IGNORE INTO role_menus (role_id, menu_key) VALUES (?, ?)');
+    for (const r of roles) {
+      insertMenu.run(r.id, '/shipping-rates');
+    }
+  } catch (_) {}
 }
 
 function migrateFromJSON() {
@@ -1650,7 +1699,7 @@ export const RoleOps = {
 
   getUserMenus(roleName) {
     if (roleName === 'admin') {
-      return ['/', '/customers', '/reminders', '/daily-report', '/quotes', '/weekly-report', '/yunwuyun', '/tracking', '/wechat', '/sales', '/admin'];
+      return ['/', '/customers', '/reminders', '/daily-report', '/quotes', '/weekly-report', '/yunwuyun', '/tracking', '/shipping-rates', '/wechat', '/sales', '/admin'];
     }
     const role = db.prepare('SELECT id FROM roles WHERE name = ?').get(roleName);
     if (!role) return [];

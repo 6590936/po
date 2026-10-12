@@ -22,6 +22,7 @@ import botRoutes from './routes/bot.js';
 import wcfBotRoutes from './routes/wcf-bot.js';
 import salesRoutes from './routes/sales/index.js';
 import trackingRoutes from '../trajectory/tracking.js';
+import shippingRatesRoutes from './routes/shipping-rates.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -50,6 +51,7 @@ app.use('/api/wechat', wechatRoutes);
 app.use('/rpa', botRoutes);
 app.use('/api/sales', salesRoutes);
 app.use('/api/tracking', trackingRoutes);
+app.use('/api/shipping-rates', shippingRatesRoutes);
 app.use('/api/bot/wcf', wcfBotRoutes);
 
 // 上传文件静态服务（支持直接打开/预览）
