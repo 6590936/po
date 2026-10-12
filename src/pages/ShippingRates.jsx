@@ -627,7 +627,15 @@ function ShippingRates() {
             </Descriptions>
             <Table
               dataSource={detailData.items || []}
-              columns={rateColumns}
+              columns={[
+                { title: '船公司', dataIndex: 'carrier_name', width: 100, render: v => <Tag color="blue">{v}</Tag> },
+                { title: '船名航次', dataIndex: 'vessel_voyage', width: 180 },
+                { title: '海运费(USD)', dataIndex: 'freight_rate', width: 120, align: 'right', render: v => v ? <Text strong style={{ color: '#cf1322' }}>$ {v.toLocaleString()}</Text> : '-' },
+                { title: '航程天数', dataIndex: 'transit_days', width: 90, render: v => v ? <Tag color="purple">{v}</Tag> : '-' },
+                { title: '订舱口', dataIndex: 'supplier_name', width: 100 },
+                { title: '联系人', dataIndex: 'supplier_contact', width: 80 },
+                { title: '备注', dataIndex: 'remarks', width: 120, render: v => v ? <Tag color="orange">{v}</Tag> : '-' },
+              ]}
               rowKey="id"
               size="small"
               pagination={false}
