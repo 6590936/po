@@ -9,6 +9,14 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 *
 
 router.use(authenticateToken);
 
+function excelDateToStr(val) {
+  if (typeof val === 'number' && val > 30000 && val < 80000) {
+    const d = new Date((val - 25569) * 86400 * 1000);
+    return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+  }
+  return val ? String(val).trim() : '';
+}
+
 // ==================== 订舱口/服务商 ====================
 
 router.get('/suppliers', (req, res) => {
@@ -52,14 +60,14 @@ router.get('/batches', (req, res) => {
   try {
     const db = getDb();
     const page = parseInt(req.query.page) || 1;
-    const size = parseInt(req.query.size) || 20;
+    const size = parseInt(req.query.pageSize) || 20;
     const offset = (page - 1) * size;
     const search = req.query.search || '';
     const status = req.query.status || '';
     const pol = req.query.pol || '';
     const pod = req.query.pod || '';
 
-    let where = 'WHERE 1=1';
+    let where = "WHERE b.pol IS NOT NULL AND b.pol != '' AND b.pod IS NOT NULL AND b.pod != '' AND b.valid_from IS NOT NULL AND b.valid_to IS NOT NULL";
     const params = [];
     if (search) { where += ' AND (b.pol LIKE ? OR b.pod LIKE ? OR b.container_type LIKE ?)'; params.push('%' + search + '%', '%' + search + '%', '%' + search + '%'); }
     if (status) { where += ' AND b.status = ?'; params.push(status); }
@@ -125,13 +133,13 @@ router.post('/batches', (req, res) => {
 
       const batchId = batchResult.lastInsertRowid;
       const insertItem = db.prepare(
-        'INSERT INTO shipping_rate_items (batch_id, carrier_name, vessel_voyage, freight_rate, transit_days, supplier_name, supplier_contact, remarks, sort_order) ' +
-        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        'INSERT INTO shipping_rate_items (batch_id, carrier_name, vessel_voyage, freight_rate, cost_freight, transit_days, supplier_name, supplier_contact, remarks, sort_order) ' +
+        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
       );
 
       items.forEach((item, idx) => {
         if (item.carrier_name) {
-          insertItem.run(batchId, item.carrier_name, item.vessel_voyage || '', item.freight_rate || 0, item.transit_days || '', item.supplier_name || '', item.supplier_contact || '', item.remarks || '', idx);
+          insertItem.run(batchId, item.carrier_name, item.vessel_voyage || '', item.freight_rate || 0, item.cost_freight || 0, item.transit_days || '', item.supplier_name || '', item.supplier_contact || '', item.remarks || '', idx);
         }
       });
     });
@@ -163,12 +171,12 @@ router.put('/batches/:id', (req, res) => {
       if (items && Array.isArray(items)) {
         db.prepare('DELETE FROM shipping_rate_items WHERE batch_id = ?').run(batchId);
         const insertItem = db.prepare(
-          'INSERT INTO shipping_rate_items (batch_id, carrier_name, vessel_voyage, freight_rate, transit_days, supplier_name, supplier_contact, remarks, sort_order) ' +
-          'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+          'INSERT INTO shipping_rate_items (batch_id, carrier_name, vessel_voyage, freight_rate, cost_freight, transit_days, supplier_name, supplier_contact, remarks, sort_order) ' +
+          'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
         );
         items.forEach((item, idx) => {
           if (item.carrier_name) {
-            insertItem.run(batchId, item.carrier_name, item.vessel_voyage || '', item.freight_rate || 0, item.transit_days || '', item.supplier_name || '', item.supplier_contact || '', item.remarks || '', idx);
+            insertItem.run(batchId, item.carrier_name, item.vessel_voyage || '', item.freight_rate || 0, item.cost_freight || 0, item.transit_days || '', item.supplier_name || '', item.supplier_contact || '', item.remarks || '', idx);
           }
         });
       }
@@ -186,6 +194,24 @@ router.delete('/batches/:id', (req, res) => {
     const db = getDb();
     db.prepare('DELETE FROM shipping_rate_batches WHERE id = ?').run(req.params.id);
     res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+router.post('/batches/batch-delete', (req, res) => {
+  try {
+    const db = getDb();
+    const { ids } = req.body;
+    if (!ids || !Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ success: false, error: '请选择要删除的批次' });
+    }
+    if (ids.length > 100) {
+      return res.status(400).json({ success: false, error: '单次最多删除100条' });
+    }
+    const placeholders = ids.map(() => '?').join(',');
+    const result = db.prepare('DELETE FROM shipping_rate_batches WHERE id IN (' + placeholders + ')').run(...ids);
+    res.json({ success: true, data: { deleted: result.changes } });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -274,58 +300,85 @@ router.post('/import', upload.single('file'), (req, res) => {
 
     if (rows.length === 0) return res.status(400).json({ success: false, error: 'Excel文件为空' });
 
-    const firstRow = rows[0];
-    const batch = {
-      pol: firstRow['起运港'] || firstRow['POL'] || '',
-      pod: firstRow['目的港'] || firstRow['POD'] || '',
-      container_type: firstRow['箱型'] || firstRow['箱型'] || '40HQ',
-      valid_from: firstRow['生效日期'] || firstRow['有效期开始'] || firstRow['FROM'] || '',
-      valid_to: firstRow['截止日期'] || firstRow['有效期结束'] || firstRow['TO'] || '',
-      notes: firstRow['备注'] || firstRow['REMARK'] || '',
-    };
+    const groups = [];
+    let currentKey = null;
+    let currentPOL = '';
+    rows.forEach((r, idx) => {
+      const pol = r['起运港'] || r['POL'] || '';
+      const pod = r['目的港'] || r['POD'] || '';
+      if (pol) currentPOL = pol;
+      if (pod) {
+        groups.push({ pol: currentPOL, pod, rows: [] });
+        currentKey = groups.length - 1;
+      }
+      if (currentKey !== null) {
+        groups[currentKey].rows.push({ ...r, _origIdx: idx });
+      }
+    });
 
-    if (!batch.pol || !batch.pod) {
+    if (groups.length === 0) {
       return res.status(400).json({ success: false, error: 'Excel缺少起运港/目的港字段，请确保包含"起运港""目的港"列或查看模板' });
-    }
-
-    const items = rows.map((r, idx) => ({
-      carrier_name: r['船公司'] || r['CARRIER'] || r['船司'] || '',
-      vessel_voyage: r['船名航次'] || r['船名/航次'] || r['VESSEL'] || '',
-      freight_rate: parseFloat(r['海运费(USD)'] || r['海运费'] || r['FREIGHT'] || 0) || 0,
-      transit_days: r['航程天数'] || r['航程'] || r['TRANSIT'] || '',
-      supplier_name: r['订舱口'] || r['订舱口/服务商'] || r['SUPPLIER'] || r['联系人公司'] || '',
-      supplier_contact: r['联系人'] || r['CONTACT'] || r['联系电话'] || '',
-      remarks: r['备注'] || r['REMARKS'] || r['特殊说明'] || '',
-      sort_order: idx,
-    })).filter(item => item.carrier_name);
-
-    if (items.length === 0) {
-      return res.status(400).json({ success: false, error: '未识别到有效的船司报价数据，请检查"船公司"列' });
     }
 
     const db = getDb();
     const now = new Date().toISOString();
     const created_by = req.user?.id || 1;
+    let totalItems = 0;
 
     const doImport = db.transaction(() => {
-      const batchResult = db.prepare(
-        "INSERT INTO shipping_rate_batches (pol, pod, container_type, valid_from, valid_to, notes, status, created_by, created_at, updated_at) " +
-        "VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)"
-      ).run(batch.pol, batch.pod, batch.container_type, batch.valid_from, batch.valid_to, batch.notes, created_by, now, now);
+      for (const group of groups) {
+        const first = group.rows[0];
+        const pol = group.pol;
+        const pod = group.pod;
+        if (!pol || !pod) continue;
 
-      const batchId = batchResult.lastInsertRowid;
-      const insertItem = db.prepare(
-        'INSERT INTO shipping_rate_items (batch_id, carrier_name, vessel_voyage, freight_rate, transit_days, supplier_name, supplier_contact, remarks, sort_order) ' +
-        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
-      );
+        const batchVals = {
+          pol,
+          pod,
+          container_type: first['箱型'] || first['箱型'] || '40HQ',
+          valid_from: excelDateToStr(first['生效日期'] || first['有效期开始'] || first['FROM'] || ''),
+          valid_to: excelDateToStr(first['截止日期'] || first['有效期结束'] || first['TO'] || ''),
+          notes: first['备注'] || first['REMARK'] || '',
+        };
 
-      items.forEach(item => {
-        insertItem.run(batchId, item.carrier_name, item.vessel_voyage, item.freight_rate, item.transit_days, item.supplier_name, item.supplier_contact, item.remarks, item.sort_order);
-      });
+        const batchResult = db.prepare(
+          "INSERT INTO shipping_rate_batches (pol, pod, container_type, valid_from, valid_to, notes, status, created_by, created_at, updated_at) " +
+          "VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)"
+        ).run(batchVals.pol, batchVals.pod, batchVals.container_type, batchVals.valid_from, batchVals.valid_to, batchVals.notes, created_by, now, now);
+
+        const batchId = batchResult.lastInsertRowid;
+        const insertItem = db.prepare(
+          'INSERT INTO shipping_rate_items (batch_id, carrier_name, vessel_voyage, freight_rate, cost_freight, transit_days, supplier_name, supplier_contact, remarks, sort_order) ' +
+          'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        );
+
+        group.rows.forEach((r, gIdx) => {
+          const carrier = r['船公司'] || r['CARRIER'] || r['船司'] || '';
+          if (!carrier) return;
+          insertItem.run(
+            batchId,
+            carrier,
+            r['船名航次'] || r['船名/航次'] || r['VESSEL'] || '',
+            parseFloat(r['海运费(USD)'] || r['海运费'] || r['FREIGHT'] || 0) || 0,
+            parseFloat(r['海运费成本'] || r['成本运费'] || r['COST'] || 0) || 0,
+            r['航程天数'] || r['航程'] || r['TRANSIT'] || '',
+            r['订舱口'] || r['订舱口/服务商'] || r['SUPPLIER'] || r['联系人公司'] || '',
+            r['联系人'] || r['CONTACT'] || r['联系电话'] || '',
+            r['备注'] || r['REMARKS'] || r['特殊说明'] || '',
+            gIdx
+          );
+          totalItems++;
+        });
+      }
     });
 
     doImport();
-    res.json({ success: true, data: { batchId: db.prepare('SELECT last_insert_rowid()').get()?.['last_insert_rowid()'], itemCount: items.length, message: '成功导入 ' + items.length + ' 条报价' } });
+
+    if (totalItems === 0) {
+      return res.status(400).json({ success: false, error: '未识别到有效的船司报价数据，请检查"船公司"列' });
+    }
+
+    res.json({ success: true, data: { batchCount: groups.length, itemCount: totalItems, message: '成功导入 ' + groups.length + ' 个批次共 ' + totalItems + ' 条报价' } });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -346,11 +399,13 @@ router.get('/batches/:id/export', (req, res) => {
     const exportData = [
       { '起运港': batch.pol, '目的港': batch.pod, '箱型': batch.container_type, '生效日期': batch.valid_from, '截止日期': batch.valid_to, '备注': batch.notes },
       {},
-      { '船公司': '', '船名航次': '', '海运费(USD)': '', '航程天数': '', '订舱口': '', '联系人': '', '备注': '' },
+      { '船公司': '', '船名航次': '', '海运费(USD)': '', '海运费成本': '', '利润(USD)': '', '航程天数': '', '订舱口': '', '联系人': '', '备注': '' },
       ...items.map(item => ({
         '船公司': item.carrier_name,
         '船名航次': item.vessel_voyage,
         '海运费(USD)': item.freight_rate,
+        '海运费成本': item.cost_freight || 0,
+        '利润(USD)': (item.freight_rate || 0) - (item.cost_freight || 0),
         '航程天数': item.transit_days || '',
         '订舱口': item.supplier_name,
         '联系人': item.supplier_contact,
@@ -376,11 +431,14 @@ router.get('/batches/:id/export', (req, res) => {
 router.get('/template', (req, res) => {
   const templateData = [
     { '起运港': '宁波', '目的港': '长滩', '箱型': '40HQ', '生效日期': '2026-10-11', '截止日期': '2026-10-14', '备注': '有效期1-3天，美西+50燃油' },
-    { '船公司': 'COSCO', '船名航次': 'GGCL-SOUTH CHINA SEA', '海运费(USD)': 8215, '航程天数': '14+', '订舱口': '聚航', '联系人': '', '备注': '' },
-    { '船公司': 'OOCL', '船名航次': 'COSCO SOUTH CHINA SEA/085E', '海运费(USD)': 8950, '航程天数': '14+', '订舱口': '中外运', '联系人': '', '备注': '' },
-    { '船公司': 'KMTC', '船名航次': 'KMTC NINGBO/2606E', '海运费(USD)': 7300, '航程天数': '14+', '订舱口': '港通', '联系人': '', '备注': '' },
-    { '船公司': 'MSC', '船名航次': 'MSC DARLENE/OG64IN', '海运费(USD)': 7750, '航程天数': '14+', '订舱口': '天津速达', '联系人': '', '备注': '缺40HQ' },
-    { '船公司': 'ONE', '船名航次': 'ONE PREMIUM/096E', '海运费(USD)': 7600, '航程天数': '14+', '订舱口': '港通', '联系人': '', '备注': '用柜严重' },
+    { '船公司': 'COSCO', '船名航次': 'GGCL-SOUTH CHINA SEA', '海运费(USD)': 8215, '海运费成本': 7000, '航程天数': '14+', '订舱口': '聚航', '联系人': '', '备注': '' },
+    { '船公司': 'OOCL', '船名航次': 'COSCO SOUTH CHINA SEA/085E', '海运费(USD)': 8950, '海运费成本': 7800, '航程天数': '14+', '订舱口': '中外运', '联系人': '', '备注': '' },
+    { '船公司': 'KMTC', '船名航次': 'KMTC NINGBO/2606E', '海运费(USD)': 7300, '海运费成本': 6200, '航程天数': '14+', '订舱口': '港通', '联系人': '', '备注': '' },
+    { '船公司': 'MSC', '船名航次': 'MSC DARLENE/OG64IN', '海运费(USD)': 7750, '海运费成本': 6600, '航程天数': '14+', '订舱口': '天津速达', '联系人': '', '备注': '缺40HQ' },
+    { '船公司': 'ONE', '船名航次': 'ONE PREMIUM/096E', '海运费(USD)': 7600, '海运费成本': 6400, '航程天数': '14+', '订舱口': '港通', '联系人': '', '备注': '用柜严重' },
+    { '目的港': '洛杉矶', '箱型': '40HQ', '生效日期': '2026-10-11', '截止日期': '2026-10-14', '备注': '同一港多目的港' },
+    { '船公司': 'COSCO', '船名航次': 'CSCL AUTUMN/103E', '海运费(USD)': 8500, '海运费成本': 7200, '航程天数': '12+', '订舱口': '聚航', '联系人': '', '备注': '' },
+    { '船公司': 'KMTC', '船名航次': 'KMTC NINGBO/2608E', '海运费(USD)': 7800, '海运费成本': 6500, '航程天数': '13+', '订舱口': '港通', '联系人': '', '备注': '' },
   ];
 
   const ws = XLSX.utils.json_to_sheet(templateData);
@@ -512,6 +570,7 @@ router.get('/batches/:id/quotation-preview', (req, res) => {
     if (!batch) return res.status(404).json({ success: false, error: '批次不存在' });
 
     var itemId = req.query.item_id;
+    var templateId = req.query.template_id;
     var item;
     if (itemId) {
       item = db.prepare('SELECT * FROM shipping_rate_items WHERE id = ? AND batch_id = ?').get(itemId, req.params.id);
@@ -530,32 +589,93 @@ router.get('/batches/:id/quotation-preview', (req, res) => {
     var carrier = item.carrier_name || '';
     var freight = item.freight_rate || 0;
 
+    // 尝试从模板加载费项
+    var templateItems = null;
+    var templateNotes = null;
+    if (templateId) {
+      var tpl = db.prepare('SELECT * FROM fee_templates WHERE id = ?').get(templateId);
+      if (tpl) {
+        var tplItems = db.prepare('SELECT * FROM fee_template_items WHERE template_id = ? AND category = ? ORDER BY sort_order, id').all(templateId, 'fee');
+        var tplNotes = db.prepare('SELECT * FROM fee_template_items WHERE template_id = ? AND category = ? ORDER BY sort_order, id').all(templateId, 'note');
+        if (tplItems.length > 0) {
+          templateItems = tplItems.map(ti => {
+            var amount = ti.amount_value;
+            if (ti.amount_type === 'freight') {
+              amount = (ti.currency || 'USD') + ' ' + freight + ' /柜';
+            }
+            return {
+              name: ti.item_name,
+              standard: ti.standard || '按每柜计费',
+              amount: amount || '-',
+              note: ti.note || '',
+              currency: ti.currency || 'USD',
+              amount_type: ti.amount_type
+            };
+          });
+        }
+        if (tplNotes.length > 0) {
+          templateNotes = tplNotes.map(tn => ({
+            name: tn.item_name,
+            free: tn.standard || '—',
+            fee: tn.amount_value || '—',
+            note: tn.note || ''
+          }));
+        }
+      }
+    }
+
+    // 没有模板则用默认硬编码
+    if (!templateItems) {
+      templateItems = [
+        { name: '基础海运费（' + pol + '-->' + pod + '）', standard: '按每柜计费', amount: 'USD ' + freight + ' /柜（含AMS+换单费）', note: '主运输核心费用\n根据当日实际价格', currency: 'USD', amount_type: 'freight' },
+        { name: '港口本地杂费（THC+DOC+EBS等）', standard: '按每柜计费', amount: 'RMB 2500 /柜', note: '预提费（提前用箱）、过夜费（装柜要过晚上12点）、待时费（装柜时间超过8小时）、落箱费（码头没有开港，找堆场存放）、预进港（码头没有开港，找黄牛放进港口）、错截费+改单费、加载费、跑空费、滞箱费、车架费用', currency: 'RMB', amount_type: 'fixed' },
+        { name: '关税', standard: '按每柜计费', amount: 'USD 2000 /柜', note: '必缴费用', currency: 'USD', amount_type: 'fixed' },
+        { name: '清关手续费', standard: '按每柜计费', amount: 'USD 220 /柜', note: '必缴费用', currency: 'USD', amount_type: 'fixed' },
+        { name: '报关费', standard: '按每柜计费', amount: 'RMB 350 /票', note: '常规普货报关，不含特殊单证报关', currency: 'RMB', amount_type: 'fixed' },
+        { name: '拖车提柜费（工厂->码头）', standard: '按每柜计费', amount: 'RMB 2600 /柜', note: '如需自提可不收取，也可根据不同的路程对应收取', currency: 'RMB', amount_type: 'fixed' },
+        { name: '尾程派送', standard: '按每柜计费', amount: 'USD 800 /柜', note: '如需自提可不收取', currency: 'USD', amount_type: 'fixed' },
+        { name: '查验风险金', standard: '按每柜计费', amount: 'USD 0 /柜', note: '加收100USD抵扣1000，依次类推（如遇到查验）', currency: 'USD', amount_type: 'fixed' },
+      ];
+    }
+
+    if (!templateNotes) {
+      templateNotes = [
+        { name: '车架费', free: '3天', fee: '约45USD/天', note: '自柜子抵达仓库完成卸柜起计算，至空柜归还船公司为止' },
+        { name: '预提费', free: '—', fee: '约200USD/次', note: '双方确认送仓时间后，若车队已完成港口提柜，因海外仓侧原因无法接收柜子入仓，将产生额外预提费用，该费用按实际发生向客户收取' },
+        { name: '夜存费', free: '—', fee: '约50USD/天', note: '柜子从港口提柜出来后，未能直接送仓，需在堆场/车场临时过夜暂存所产生的费用，按实际发生收取' },
+        { name: '改地址/改派送方式', free: '需提前7天', fee: '可能产生约100USD改单费', note: '客户变更需提前沟通（如更改地址或者改自提）' },
+      ];
+    }
+
+    // 汇总计算
+    var usdTotal = 0;
+    var rmbTotal = 0;
+    templateItems.forEach(function(ti) {
+      var amt = ti.amount || '';
+      var numMatch = amt.match(/([\d,]+)/);
+      if (numMatch) {
+        var num = parseFloat(numMatch[1].replace(/,/g, '')) || 0;
+        if (amt.toUpperCase().includes('USD') || ti.currency === 'USD') {
+          usdTotal += num;
+        } else {
+          rmbTotal += num;
+        }
+      }
+    });
+
     var data = {
       _batchId: req.params.id,
       _itemId: itemId || '',
+      _templateId: templateId || '',
       pol: pol,
       pod: pod,
       ct: ct,
       carrier: carrier,
       vessel: item.vessel_voyage || '',
       freight: freight,
-      items: [
-        { name: '基础海运费（' + pol + '-->' + pod + '）', standard: '按每柜计费', amount: 'USD ' + freight + ' /柜（含AMS+换单费）', note: '主运输核心费用\n根据当日实际价格' },
-        { name: '港口本地杂费（THC+DOC+EBS等）', standard: '按每柜计费', amount: 'RMB 2500 /柜', note: '预提费（提前用箱）、过夜费（装柜要过晚上12点）、待时费（装柜时间超过8小时）、落箱费（码头没有开港，找堆场存放）、预进港（码头没有开港，找黄牛放进港口）、错截费+改单费、加载费、跑空费、滞箱费、车架费用' },
-        { name: '关税', standard: '按每柜计费', amount: 'USD 2000 /柜', note: '必缴费用' },
-        { name: '清关手续费', standard: '按每柜计费', amount: 'USD 220 /柜', note: '必缴费用' },
-        { name: '报关费', standard: '按每柜计费', amount: 'RMB 350 /票', note: '常规普货报关，不含特殊单证报关' },
-        { name: '拖车提柜费（工厂->码头）', standard: '按每柜计费', amount: 'RMB 2600 /柜', note: '如需自提可不收取，也可根据不同的路程对应收取' },
-        { name: '尾程派送', standard: '按每柜计费', amount: 'USD 800 /柜', note: '如需自提可不收取' },
-        { name: '查验风险金', standard: '按每柜计费', amount: 'USD 0 /柜', note: '加收100USD抵扣1000，依次类推（如遇到查验）' },
-      ],
-      total: { usd: freight + 2000 + 220 + 800, rmb: 2500 + 350 + 2600, all: freight + 2000 + 220 + 800 + 2500 + 350 + 2600 },
-      notes: [
-        { name: '车架费', free: '3天', fee: '约45USD/天', note: '自柜子抵达仓库完成卸柜起计算，至空柜归还船公司为止' },
-        { name: '预提费', free: '—', fee: '约200USD/次', note: '双方确认送仓时间后，若车队已完成港口提柜，因海外仓侧原因无法接收柜子入仓，将产生额外预提费用，该费用按实际发生向客户收取' },
-        { name: '夜存费', free: '—', fee: '约50USD/天', note: '柜子从港口提柜出来后，未能直接送仓，需在堆场/车场临时过夜暂存所产生的费用，按实际发生收取' },
-        { name: '改地址/改派送方式', free: '需提前7天', fee: '可能产生约100USD改单费', note: '客户变更需提前沟通（如更改地址或者改自提）' },
-      ]
+      items: templateItems,
+      total: { usd: usdTotal, rmb: rmbTotal },
+      notes: templateNotes
     };
 
     res.json({ success: true, data: data });

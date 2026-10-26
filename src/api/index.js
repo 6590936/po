@@ -303,6 +303,7 @@ export const shippingRatesAPI = {
   createBatch: (data) => request('/shipping-rates/batches', { method: 'POST', body: JSON.stringify(data) }),
   updateBatch: (id, data) => request(`/shipping-rates/batches/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deleteBatch: (id) => request(`/shipping-rates/batches/${id}`, { method: 'DELETE' }),
+  deleteBatches: (ids) => request('/shipping-rates/batches/batch-delete', { method: 'POST', body: JSON.stringify({ ids }) }),
   updateBatchStatus: (id, status) => request(`/shipping-rates/batches/${id}/status`, { method: 'PUT', body: JSON.stringify({ status }) }),
   getActiveRates: (params = {}) => { const query = new URLSearchParams(params).toString(); return request(`/shipping-rates/active?${query}`); },
   getFilters: () => request('/shipping-rates/filters'),

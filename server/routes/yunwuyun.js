@@ -506,7 +506,8 @@ router.put('/customers/:id/enable-login', async (req, res) => {
     const hashed = bcrypt.hashSync(password, 10);
     db.prepare('UPDATE yunwuyun_customers SET login_enabled = 1, login_account = ?, login_password = ? WHERE client_id = ?')
       .run(login_account, hashed, parseInt(req.params.id));
-    res.json({ success: true, data: { message: '客户登录已开通' } });
+    const loginUrl = process.env.CLIENT_URL || 'http://localhost:5173/client/login';
+    res.json({ success: true, data: { message: '客户登录已开通', login_url: loginUrl } });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }

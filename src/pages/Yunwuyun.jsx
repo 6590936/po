@@ -10,7 +10,7 @@ import {
   SearchOutlined, SyncOutlined, ReloadOutlined,
   DollarOutlined, FileTextOutlined, TeamOutlined, TrophyOutlined,
   PlusOutlined, EyeOutlined, EditOutlined, DeleteOutlined, SettingOutlined,
-  EnvironmentOutlined, CheckCircleFilled, ClockCircleFilled,
+  EnvironmentOutlined, CheckCircleFilled, ClockCircleFilled, CopyOutlined,
 } from '@ant-design/icons';
 import { yunwuyunAPI, trackingAPI } from '../api';
 import dayjs from 'dayjs';
@@ -76,6 +76,8 @@ function Yunwuyun() {
   const [accountName, setAccountName] = useState('');
   const [accountPwd, setAccountPwd] = useState('');
   const [accountLoading, setAccountLoading] = useState(false);
+  const [enableSuccess, setEnableSuccess] = useState(false);
+  const [loginUrl, setLoginUrl] = useState('');
 
   // 详情抽屉
   const [detailVisible, setDetailVisible] = useState(false);
@@ -346,8 +348,14 @@ function Yunwuyun() {
       }
       if (res.message) {
         message.success(res.message);
-        setAccountModal({ visible: false, customer: null, mode: '' });
-        fetchCustomers();
+        if (accountModal.mode === 'enable' && res.login_url) {
+          setLoginUrl(res.login_url);
+          setEnableSuccess(true);
+        } else {
+          setAccountModal({ visible: false, customer: null, mode: '' });
+          setEnableSuccess(false);
+          fetchCustomers();
+        }
       } else {
         message.error(res.error || '操作失败');
       }
@@ -356,6 +364,27 @@ function Yunwuyun() {
     } finally {
       setAccountLoading(false);
     }
+  };
+
+  const handleCopyUrl = (url) => {
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(url).then(() => {
+        message.success('已复制到剪贴板');
+      }).catch(() => {
+        fallbackCopy(url);
+      });
+    } else {
+      fallbackCopy(url);
+    }
+  };
+
+  const fallbackCopy = (text) => {
+    const input = document.createElement('input');
+    input.value = text;
+    document.body.appendChild(input);
+    input.select();
+    try { document.execCommand('copy'); message.success('已复制到剪贴板'); } catch (_) { message.info('请手动复制：' + text); }
+    document.body.removeChild(input);
   };
 
   const handleDelete = async (type, id) => {
@@ -517,6 +546,19 @@ function Yunwuyun() {
     { title: '国家', dataIndex: 'country_name', key: 'country_name', width: 100 },
     { title: '客户端', dataIndex: 'login_enabled', key: 'login_enabled', width: 80,
       render: (v) => v ? <Tag color="green">已开通</Tag> : <Tag color="default">未开通</Tag> },
+    { title: '登录地址', dataIndex: 'login_enabled', key: 'login_url', width: 220, ellipsis: true,
+      render: (v, r) => {
+        if (!v) return <span style={{ color: '#ccc' }}>—</span>;
+        const url = window.location.origin + '/client/login';
+        return (
+          <Space size={4}>
+            <a href={url} target="_blank" rel="noreferrer" style={{ fontSize: 12 }}>{url}</a>
+            <Button type="link" size="small" icon={<CopyOutlined />}
+              onClick={(e) => { e.stopPropagation(); handleCopyUrl(url); }} />
+          </Space>
+        );
+      },
+    },
     { title: '操作', key: 'action', width: 260, fixed: 'right',
       render: (_, r) => (
         <Space size="small">
@@ -1335,18 +1377,37 @@ function Yunwuyun() {
       {/* 客户账号管理弹窗 */}
       <Modal
         title={
+          enableSuccess ? '开通成功' :
           accountModal.mode === 'enable' ? '开通客户端登录' :
           accountModal.mode === 'reset' ? '重置客户密码' : '关闭客户端登录'
         }
         open={accountModal.visible}
-        onOk={accountModal.mode === 'disable' ? handleAccountSubmit : handleAccountSubmit}
-        onCancel={() => setAccountModal({ visible: false, customer: null, mode: '' })}
+        onOk={enableSuccess ? () => {
+          setAccountModal({ visible: false, customer: null, mode: '' });
+          setEnableSuccess(false);
+          fetchCustomers();
+        } : accountModal.mode === 'disable' ? handleAccountSubmit : handleAccountSubmit}
+        onCancel={() => { setAccountModal({ visible: false, customer: null, mode: '' }); setEnableSuccess(false); }}
         confirmLoading={accountLoading}
-        okText="确认"
-        cancelText="取消"
+        okText={enableSuccess ? '关闭' : '确认'}
+        cancelText={enableSuccess ? null : '取消'}
+        cancelButtonProps={enableSuccess ? { style: { display: 'none' } } : undefined}
         destroyOnHidden
       >
-        {accountModal.mode === 'disable' ? (
+        {enableSuccess ? (
+          <div style={{ textAlign: 'center', padding: '12px 0' }}>
+            <CheckCircleFilled style={{ fontSize: 48, color: '#52c41a', marginBottom: 12 }} />
+            <p style={{ fontSize: 16, fontWeight: 500, marginBottom: 16 }}>客户登录已开通！</p>
+            <div style={{ textAlign: 'left', background: '#f6ffed', border: '1px solid #b7eb8f', borderRadius: 4, padding: 12 }}>
+              <p style={{ marginBottom: 8, color: '#666' }}>登录地址：</p>
+              <Space.Compact style={{ width: '100%' }}>
+                <Input value={loginUrl} readOnly style={{ flex: 1 }} />
+                <Button type="primary" icon={<CopyOutlined />} onClick={() => handleCopyUrl(loginUrl)}>复制地址</Button>
+              </Space.Compact>
+              <p style={{ marginTop: 8, color: '#999', fontSize: 12 }}>请将此地址发送给客户，客户即可登录查看报价</p>
+            </div>
+          </div>
+        ) : accountModal.mode === 'disable' ? (
           <p>确认关闭客户 <strong>{accountModal.customer?.client_name}</strong> 的客户端登录权限？</p>
         ) : (
           <>

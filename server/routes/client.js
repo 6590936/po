@@ -2,6 +2,7 @@
 import express from 'express';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
+import XLSX from 'xlsx';
 import { getDb } from '../database.js';
 
 const router = express.Router();
@@ -166,6 +167,197 @@ router.get('/stats', authenticateClient, (req, res) => {
   res.json({
     totalOrders, totalAR, totalAP, totalVolume, totalPieces, totalGrossKgs, recentOrders,
   });
+});
+
+// 客户海运报价筛选下拉（只读）
+router.get('/shipping-rates/filters', authenticateClient, (req, res) => {
+  try {
+    const db = getDb();
+    const pols = db.prepare("SELECT DISTINCT pol FROM shipping_rate_batches WHERE status='active' AND valid_from <= date('now','localtime') AND valid_to >= date('now','localtime') ORDER BY pol").all();
+    const pods = db.prepare("SELECT DISTINCT pod FROM shipping_rate_batches WHERE status='active' AND valid_from <= date('now','localtime') AND valid_to >= date('now','localtime') ORDER BY pod").all();
+    const types = db.prepare("SELECT DISTINCT container_type FROM shipping_rate_batches WHERE status='active' AND valid_from <= date('now','localtime') AND valid_to >= date('now','localtime') ORDER BY container_type").all();
+    res.json({ success: true, data: { pols: pols.map(r => r.pol), pods: pods.map(r => r.pod), container_types: types.map(r => r.container_type) } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 客户报价单预览
+router.get('/shipping-rates/batches/:id/quotation-preview', authenticateClient, (req, res) => {
+  try {
+    const db = getDb();
+    const batch = db.prepare('SELECT * FROM shipping_rate_batches WHERE id = ?').get(req.params.id);
+    if (!batch) return res.status(404).json({ success: false, error: '批次不存在' });
+
+    var itemId = req.query.item_id;
+    var item;
+    if (itemId) {
+      item = db.prepare('SELECT * FROM shipping_rate_items WHERE id = ? AND batch_id = ?').get(itemId, req.params.id);
+      if (!item) return res.status(404).json({ success: false, error: '报价明细不存在' });
+    } else {
+      var items = db.prepare('SELECT * FROM shipping_rate_items WHERE batch_id = ? ORDER BY freight_rate ASC, sort_order, id').all(req.params.id);
+      if (items.length === 0) return res.status(400).json({ success: false, error: '该批次无报价明细' });
+      item = items[0];
+    }
+
+    var pol = batch.pol || '';
+    var pod = batch.pod || '';
+    var ct = batch.container_type || '';
+    var carrier = item.carrier_name || '';
+    var freight = item.freight_rate || 0;
+
+    var templateItems = [
+      { name: '基础海运费（' + pol + '-->' + pod + '）', standard: '按每柜计费', amount: 'USD ' + freight + ' /柜（含AMS+换单费）', note: '主运输核心费用\n根据当日实际价格', currency: 'USD', amount_type: 'freight' },
+      { name: '港口本地杂费（THC+DOC+EBS等）', standard: '按每柜计费', amount: 'RMB 2500 /柜', note: '预提费（提前用箱）、过夜费（装柜要过晚上12点）、待时费（装柜时间超过8小时）、落箱费（码头没有开港，找堆场存放）、预进港（码头没有开港，找黄牛放进港口）、错截费+改单费、加载费、跑空费、滞箱费、车架费用', currency: 'RMB', amount_type: 'fixed' },
+      { name: '关税', standard: '按每柜计费', amount: 'USD 2000 /柜', note: '必缴费用', currency: 'USD', amount_type: 'fixed' },
+      { name: '清关手续费', standard: '按每柜计费', amount: 'USD 220 /柜', note: '必缴费用', currency: 'USD', amount_type: 'fixed' },
+      { name: '报关费', standard: '按每柜计费', amount: 'RMB 350 /票', note: '常规普货报关，不含特殊单证报关', currency: 'RMB', amount_type: 'fixed' },
+      { name: '拖车提柜费（工厂->码头）', standard: '按每柜计费', amount: 'RMB 2600 /柜', note: '如需自提可不收取，也可根据不同的路程对应收取', currency: 'RMB', amount_type: 'fixed' },
+      { name: '尾程派送', standard: '按每柜计费', amount: 'USD 800 /柜', note: '如需自提可不收取', currency: 'USD', amount_type: 'fixed' },
+      { name: '查验风险金', standard: '按每柜计费', amount: 'USD 0 /柜', note: '加收100USD抵扣1000，依次类推（如遇到查验）', currency: 'USD', amount_type: 'fixed' },
+    ];
+
+    var templateNotes = [
+      { name: '车架费', free: '3天', fee: '约45USD/天', note: '自柜子抵达仓库完成卸柜起计算，至空柜归还船公司为止' },
+      { name: '预提费', free: '—', fee: '约200USD/次', note: '双方确认送仓时间后，若车队已完成港口提柜，因海外仓侧原因无法接收柜子入仓，将产生额外预提费用，该费用按实际发生向客户收取' },
+      { name: '夜存费', free: '—', fee: '约50USD/天', note: '柜子从港口提柜出来后，未能直接送仓，需在堆场/车场临时过夜暂存所产生的费用，按实际发生收取' },
+      { name: '改地址/改派送方式', free: '需提前7天', fee: '可能产生约100USD改单费', note: '客户变更需提前沟通（如更改地址或者改自提）' },
+    ];
+
+    var usdTotal = 0;
+    var rmbTotal = 0;
+    templateItems.forEach(function(ti) {
+      var amt = ti.amount || '';
+      var numMatch = amt.match(/([\d,]+)/);
+      if (numMatch) {
+        var num = parseFloat(numMatch[1].replace(/,/g, '')) || 0;
+        if (amt.toUpperCase().includes('USD') || ti.currency === 'USD') usdTotal += num;
+        else rmbTotal += num;
+      }
+    });
+
+    res.json({ success: true, data: {
+      _batchId: req.params.id, _itemId: itemId || '', _templateId: '',
+      pol, pod, ct, carrier, vessel: item.vessel_voyage || '', freight,
+      items: templateItems, total: { usd: usdTotal, rmb: rmbTotal }, notes: templateNotes,
+    }});
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 客户报价单 Excel 下载
+router.get('/shipping-rates/batches/:id/quotation', authenticateClient, (req, res) => {
+  try {
+    const db = getDb();
+    const batch = db.prepare('SELECT * FROM shipping_rate_batches WHERE id = ?').get(req.params.id);
+    if (!batch) return res.status(404).json({ success: false, error: '批次不存在' });
+
+    var itemId = req.query.item_id;
+    var item;
+    if (itemId) {
+      item = db.prepare('SELECT * FROM shipping_rate_items WHERE id = ? AND batch_id = ?').get(itemId, req.params.id);
+      if (!item) return res.status(404).json({ success: false, error: '报价明细不存在' });
+    } else {
+      var items = db.prepare('SELECT * FROM shipping_rate_items WHERE batch_id = ? ORDER BY freight_rate ASC, sort_order, id').all(req.params.id);
+      if (items.length === 0) return res.status(400).json({ success: false, error: '该批次无报价明细' });
+      item = items[0];
+    }
+
+    var pol = batch.pol || '';
+    var pod = batch.pod || '';
+    var ct = batch.container_type || '';
+    var carrier = item.carrier_name || '';
+    var freight = item.freight_rate || 0;
+
+    var headerStyle = { font: { bold: true, sz: 12, color: { rgb: 'FFFFFF' }, name: '微软雅黑' }, fill: { fgColor: { rgb: '1F4E79' } }, alignment: { horizontal: 'center', vertical: 'center' }, border: { top: { style: 'thin', color: { rgb: '000000' } }, bottom: { style: 'thin', color: { rgb: '000000' } }, left: { style: 'thin', color: { rgb: '000000' } }, right: { style: 'thin', color: { rgb: '000000' } } } };
+    var sectionStyle = { font: { bold: true, sz: 11, color: { rgb: 'FFFFFF' }, name: '微软雅黑' }, fill: { fgColor: { rgb: '5B9BD5' } }, alignment: { horizontal: 'center', vertical: 'center' }, border: { top: { style: 'thin', color: { rgb: '000000' } }, bottom: { style: 'thin', color: { rgb: '000000' } }, left: { style: 'thin', color: { rgb: '000000' } }, right: { style: 'thin', color: { rgb: '000000' } } } };
+    var totalStyle = { font: { bold: true, sz: 11, name: '微软雅黑' }, fill: { fgColor: { rgb: 'FFF2CC' } }, alignment: { horizontal: 'center', vertical: 'center' }, border: { top: { style: 'thin', color: { rgb: '000000' } }, bottom: { style: 'thin', color: { rgb: '000000' } }, left: { style: 'thin', color: { rgb: '000000' } }, right: { style: 'thin', color: { rgb: '000000' } } } };
+    var cellStyle = { font: { sz: 10, name: '微软雅黑' }, alignment: { vertical: 'center', wrapText: true }, border: { top: { style: 'thin', color: { rgb: 'D9D9D9' } }, bottom: { style: 'thin', color: { rgb: 'D9D9D9' } }, left: { style: 'thin', color: { rgb: 'D9D9D9' } }, right: { style: 'thin', color: { rgb: 'D9D9D9' } } } };
+
+    var aoa = [
+      [''], ['费用项目', '计费标准', '费用金额', '备注'],
+      ['基础海运费（' + pol + '-->' + pod + '）', '按每柜计费', 'USD ' + freight + ' /柜（含AMS+换单费）', '主运输核心费用\n根据当日实际价格'],
+      ['港口本地杂费（THC+DOC+EBS等）', '按每柜计费', 'RMB 2500 /柜', '预提费（提前用箱）\n过夜费（装柜要过晚上12点）\n待时费（装柜时间超过8小时）\n落箱费（码头没有开港，找堆场存放）\n预进港（码头没有开港，找黄牛放进港口）\n错截费（船司已经截单资料，柜子没装好）+改单费\n加载费（船司甩柜后，加钱找黄牛上船）\n跑空费（通知柜子已卸空，实际车队提空柜时海外仓未卸空）\n滞箱费（柜子在海外仓时间过长，一般为提出后7天）\n车架费用（柜子车架的使用费用，一般免费3天）'],
+      ['关税', '按每柜计费', 'USD 2000 /柜', '必缴费用'],
+      ['清关手续费', '按每柜计费', 'USD 220 /柜', '必缴费用'],
+      ['报关费', '按每柜计费', 'RMB 350 /票', '常规普货报关，不含特殊单证报关'],
+      ['拖车提柜费（工厂->码头）', '按每柜计费', 'RMB 2600 /柜', '如需自提可不收取，也可根据不同的路程对应收取'],
+      ['尾程派送', '按每柜计费', 'USD 800 /柜', '如需自提可不收取'],
+      ['查验风险金', '按每柜计费', 'USD 0 /柜', '加收100USD抵扣1000，依次类推（如遇到查验）'],
+      ['合计费用', '一票总计', 'USD ' + (freight + 2000 + 220 + 800) + ' + RMB ' + (2500 + 350 + 2600), ''],
+      [''], ['尾程派送注意事项'],
+      ['费用项目', '免费期', '超期标准', '备注'],
+      ['车架费', '3天', '约45USD/天', '自柜子抵达仓库完成卸柜起计算，至空柜归还船公司为止'],
+      ['预提费', '—', '约200USD/次', '双方确认送仓时间后，若车队已完成港口提柜，因海外仓侧原因无法接收柜子入仓，将产生额外预提费用，该费用按实际发生向客户收取'],
+      ['夜存费', '—', '约50USD/天', '柜子从港口提柜出来后，未能直接送仓，需在堆场/车场临时过夜暂存所产生的费用，按实际发生收取'],
+      ['改地址/改派送方式', '需提前7天', '可能产生约100USD改单费', '客户变更需提前沟通（如更改地址或者改自提）'],
+    ];
+
+    var ws = XLSX.utils.aoa_to_sheet(aoa);
+    ws['!cols'] = [{ wch: 32 }, { wch: 14 }, { wch: 28 }, { wch: 60 }];
+    ws['!rows'] = [];
+    for (var ri = 0; ri < aoa.length; ri++) ws['!rows'][ri] = { hpt: ri === 3 ? 120 : (ri === 12 ? 25 : 22) };
+
+    var setCellStyle = function(cell, style) { if (cell) cell.s = style; };
+    for (var ci = 0; ci <= 3; ci++) setCellStyle(ws[XLSX.utils.encode_cell({ r: 1, c: ci })], headerStyle);
+    for (ci = 0; ci <= 3; ci++) setCellStyle(ws[XLSX.utils.encode_cell({ r: 12, c: ci })], sectionStyle);
+    for (ci = 0; ci <= 3; ci++) setCellStyle(ws[XLSX.utils.encode_cell({ r: 11, c: ci })], totalStyle);
+    for (var row = 2; row <= 10; row++) for (var col = 0; col <= 3; col++) setCellStyle(ws[XLSX.utils.encode_cell({ r: row, c: col })], cellStyle);
+    for (var row2 = 13; row2 <= 17; row2++) for (var col2 = 0; col2 <= 3; col2++) setCellStyle(ws[XLSX.utils.encode_cell({ r: row2, c: col2 })], cellStyle);
+
+    ws['!merges'] = [
+      { s: { r: 1, c: 0 }, e: { r: 1, c: 3 } },
+      { s: { r: 12, c: 0 }, e: { r: 12, c: 3 } },
+    ];
+
+    var wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, '报价单');
+    var buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+    var filename = encodeURIComponent('报价_' + carrier + '_' + pol + '-' + pod + '_' + ct + '.xlsx');
+    res.setHeader('Content-Disposition', "attachment; filename*=UTF-8''" + filename);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.send(buf);
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 客户海运报价（只读，不含成本）
+router.get('/shipping-rates', authenticateClient, (req, res) => {
+  try {
+    const db = getDb();
+    const pol = req.query.pol || '';
+    const pod = req.query.pod || '';
+    const container_type = req.query.container_type || '';
+
+    let where = "WHERE b.status = 'active' AND b.valid_from <= date('now','localtime') AND b.valid_to >= date('now','localtime')";
+    const params = [];
+    if (pol) { where += ' AND b.pol = ?'; params.push(pol); }
+    if (pod) { where += ' AND b.pod = ?'; params.push(pod); }
+    if (container_type) { where += ' AND b.container_type = ?'; params.push(container_type); }
+
+    const batches = db.prepare(
+      'SELECT b.*, u.name as created_by_name ' +
+      'FROM shipping_rate_batches b ' +
+      'LEFT JOIN users u ON b.created_by = u.id ' +
+      where +
+      ' ORDER BY b.valid_from DESC'
+    ).all(...params);
+
+    const getItems = db.prepare(
+      'SELECT id, batch_id, carrier_name, vessel_voyage, freight_rate, transit_days, remarks, sort_order FROM shipping_rate_items WHERE batch_id = ? ORDER BY sort_order, id'
+    );
+
+    const result = batches.map(b => ({
+      ...b,
+      items: getItems.all(b.id),
+    }));
+
+    res.json({ success: true, data: result });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
 // 更新客户资料（营业执照、公司信息等）

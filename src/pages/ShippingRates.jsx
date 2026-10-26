@@ -2,14 +2,14 @@ import React, { useState, useEffect, useCallback } from 'react';
 import {
   Table, Card, Input, Button, Tag, Space, Typography, Row, Col, Statistic,
   message, Select, Modal, Form, InputNumber, DatePicker, Popconfirm, Descriptions,
-  Tabs, Upload, Tooltip,
+  Tabs, Upload, Tooltip, Dropdown, Pagination, Drawer, Spin,
 } from 'antd';
 import {
   SearchOutlined, PlusOutlined, ExportOutlined, UploadOutlined,
   DownloadOutlined, EditOutlined, DeleteOutlined, EyeOutlined,
   DollarOutlined, CheckCircleOutlined, MinusCircleOutlined,
   FileExcelOutlined, ReloadOutlined, HistoryOutlined,
-  SettingOutlined,
+  SettingOutlined, MoreOutlined,
 } from '@ant-design/icons';
 import { shippingRatesAPI } from '../api';
 import useAuthStore from '../store/authStore';
@@ -32,6 +32,12 @@ function ShippingRates() {
   const [params, setParams] = useState({ page: 1, pageSize: 20, search: '', status: '' });
   const [filters, setFilters] = useState({ pols: [], pods: [], container_types: [] });
   const [importing, setImporting] = useState(false);
+  const [selectedRowKeys, setSelectedRowKeys] = useState([]);
+  const [editingRoute, setEditingRoute] = useState(null);
+  const [activePolTab, setActivePolTab] = useState('');
+
+  const user = useAuthStore((s) => s.user);
+  const isAdmin = user?.role === 'admin' || user?.role === 'manager';
 
   // 销售看板
   const [activeRates, setActiveRates] = useState([]);
@@ -59,6 +65,11 @@ function ShippingRates() {
   const [suppliers, setSuppliers] = useState([]);
   const [supplierForm] = Form.useForm();
   const [supplierSaving, setSupplierSaving] = useState(false);
+
+  // 航线子批次抽屉
+  const [subBatchRoute, setSubBatchRoute] = useState(null);
+  const [subBatchItems, setSubBatchItems] = useState({});
+  const [subBatchLoading, setSubBatchLoading] = useState(false);
 
   const fetchBatches = useCallback(async () => {
     setLoading(true);
@@ -95,10 +106,38 @@ function ShippingRates() {
   useEffect(() => { fetchBatches(); fetchFilters(); }, [fetchBatches, fetchFilters]);
   useEffect(() => { if (activeTab === 'active') fetchActiveRates(); }, [activeTab, fetchActiveRates]);
 
+  useEffect(() => {
+    if (activeRates.length > 0) {
+      const firstPol = activeRates[0]?.pol;
+      if (firstPol && !activePolTab) setActivePolTab(firstPol);
+    }
+  }, [activeRates]);
+
+  useEffect(() => {
+    if (!subBatchRoute) return;
+    setSubBatchLoading(true);
+    setSubBatchItems({});
+    const children = subBatchRoute.children || [];
+    Promise.allSettled(children.map(b => shippingRatesAPI.getBatch(b.id)))
+      .then(results => {
+        const map = {};
+        results.forEach((r, i) => {
+          map[children[i].id] = (r.status === 'fulfilled' && r.value?.items) ? r.value.items : [];
+        });
+        setSubBatchItems(map);
+      })
+      .finally(() => setSubBatchLoading(false));
+  }, [subBatchRoute]);
+
+  useEffect(() => {
+    setSelectedRowKeys([]);
+  }, [params.page, params.pageSize, params.search, params.status]);
+
   // ==================== 批次管理 ====================
 
   const handleCreate = () => {
     setEditingBatch(null);
+    setEditingRoute(null);
     setModalTitle('新增报价批次');
     form.resetFields();
     form.setFieldsValue({ valid_range: [dayjs(), dayjs().add(3, 'day')] });
@@ -107,11 +146,15 @@ function ShippingRates() {
 
   const handleEdit = async (record) => {
     setEditingBatch(record);
+    setEditingRoute(null);
     setModalTitle('编辑报价批次');
+    form.resetFields();
+    setModalVisible(true);
     try {
       const res = await shippingRatesAPI.getBatch(record.id);
       const batch = res;
-      form.setFieldsValue({
+      setTimeout(() => {
+        form.setFieldsValue({
         pol: batch.pol,
         pod: batch.pod,
         container_type: batch.container_type,
@@ -121,13 +164,14 @@ function ShippingRates() {
           carrier_name: item.carrier_name,
           vessel_voyage: item.vessel_voyage,
           freight_rate: item.freight_rate,
+          cost_freight: item.cost_freight || 0,
           transit_days: item.transit_days || '',
           supplier_name: item.supplier_name,
           supplier_contact: item.supplier_contact,
           remarks: item.remarks,
         })),
       });
-      setModalVisible(true);
+      }, 50);
     } catch (err) {
       message.error('获取批次详情失败: ' + err.message);
     }
@@ -138,24 +182,79 @@ function ShippingRates() {
       const values = await form.validateFields();
       setSaving(true);
 
-      const payload = {
-        pol: values.pol,
-        pod: values.pod,
-        container_type: values.container_type,
-        valid_from: values.valid_range?.[0]?.format('YYYY-MM-DD') || '',
-        valid_to: values.valid_range?.[1]?.format('YYYY-MM-DD') || '',
-        notes: values.notes || '',
-        items: (values.items || []).filter(i => i && i.carrier_name),
-      };
+      if (editingRoute) {
+        const itemsByBatch = {};
+        (values.items || []).forEach(item => {
+          if (!item.carrier_name) return;
+          const batchId = item._batchId;
+          if (!itemsByBatch[batchId]) itemsByBatch[batchId] = [];
+          itemsByBatch[batchId].push({
+            carrier_name: item.carrier_name,
+            vessel_voyage: item.vessel_voyage || '',
+            freight_rate: item.freight_rate || 0,
+            cost_freight: item.cost_freight || 0,
+            transit_days: item.transit_days || '',
+            supplier_name: item.supplier_name || '',
+            supplier_contact: item.supplier_contact || '',
+            remarks: item.remarks || '',
+            _itemId: item._itemId,
+          });
+        });
 
-      if (editingBatch) {
-        await shippingRatesAPI.updateBatch(editingBatch.id, payload);
-        message.success('更新成功');
+        let successCount = 0;
+        for (const [batchId, items] of Object.entries(itemsByBatch)) {
+          try {
+            await shippingRatesAPI.updateBatch(parseInt(batchId), {
+              pol: values.pol,
+              pod: values.pod,
+              container_type: (editingRoute.children || []).find(b => b.id === parseInt(batchId))?.container_type || '40HQ',
+              valid_from: values.valid_range?.[0]?.format('YYYY-MM-DD') || '',
+              valid_to: values.valid_range?.[1]?.format('YYYY-MM-DD') || '',
+              notes: values.notes || '',
+              items,
+            });
+            successCount++;
+          } catch (err) {
+            console.error(`更新批次 ${batchId} 失败:`, err);
+          }
+        }
+        
+        if (successCount > 0) {
+          message.success(`已更新 ${successCount} 个批次的报价`);
+        } else {
+          message.error('保存失败');
+        }
       } else {
-        await shippingRatesAPI.createBatch(payload);
-        message.success('创建成功');
+        const payload = {
+          pol: values.pol,
+          pod: values.pod,
+          container_type: values.container_type,
+          valid_from: values.valid_range?.[0]?.format('YYYY-MM-DD') || '',
+          valid_to: values.valid_range?.[1]?.format('YYYY-MM-DD') || '',
+          notes: values.notes || '',
+          items: (values.items || []).filter(i => i && i.carrier_name).map(i => ({
+            carrier_name: i.carrier_name,
+            vessel_voyage: i.vessel_voyage,
+            freight_rate: i.freight_rate,
+            cost_freight: i.cost_freight,
+            transit_days: i.transit_days,
+            supplier_name: i.supplier_name,
+            supplier_contact: i.supplier_contact,
+            remarks: i.remarks,
+          })),
+        };
+
+        if (editingBatch) {
+          await shippingRatesAPI.updateBatch(editingBatch.id, payload);
+          message.success('更新成功');
+        } else {
+          await shippingRatesAPI.createBatch(payload);
+          message.success('创建成功');
+        }
       }
+      
       setModalVisible(false);
+      setEditingRoute(null);
       fetchBatches();
     } catch (err) {
       if (err.errorFields) return;
@@ -175,6 +274,30 @@ function ShippingRates() {
     }
   };
 
+  const handleBatchDelete = async () => {
+    if (selectedRowKeys.length === 0) {
+      message.warning('请先选择要删除的批次');
+      return;
+    }
+    try {
+      const ids = [];
+      for (const key of selectedRowKeys) {
+        const parts = key.replace('route-', '').split('|');
+        if (parts.length >= 2) {
+          batches.forEach(b => {
+            if (b.pol === parts[0] && b.pod === parts.slice(1).join('|')) ids.push(b.id);
+          });
+        }
+      }
+      await shippingRatesAPI.deleteBatches(ids);
+      message.success(`成功删除 ${ids.length} 个批次`);
+      setSelectedRowKeys([]);
+      fetchBatches();
+    } catch (err) {
+      message.error('批量删除失败: ' + err.message);
+    }
+  };
+
   const handleStatus = async (id, status) => {
     try {
       await shippingRatesAPI.updateBatchStatus(id, status);
@@ -182,6 +305,79 @@ function ShippingRates() {
       fetchBatches();
     } catch (err) {
       message.error('操作失败: ' + err.message);
+    }
+  };
+
+  const handleRouteEdit = async (route) => {
+    setEditingRoute(route);
+    setEditingBatch(null);
+    setModalTitle(`编辑航线 ${route.pol} → ${route.pod}`);
+    form.resetFields();
+    setModalVisible(true);
+
+    try {
+      const results = await Promise.allSettled(
+        (route.children || []).map(batch => shippingRatesAPI.getBatch(batch.id))
+      );
+      const allItems = [];
+      results.forEach((result, i) => {
+        if (result.status === 'fulfilled') {
+          const res = result.value;
+          const batch = (route.children || [])[i];
+          if (res && Array.isArray(res.items)) {
+            res.items.forEach(item => {
+              allItems.push({
+                ...item,
+                _batchId: batch.id,
+                _containerType: batch.container_type,
+                _validFrom: batch.valid_from,
+                _validTo: batch.valid_to,
+                _batchNotes: batch.notes || '',
+              });
+            });
+          }
+        } else {
+          console.error('获取批次失败:', result.reason?.message);
+        }
+      });
+
+      const populateForm = () => {
+        form.setFieldsValue({
+          pol: route.pol,
+          pod: route.pod,
+          container_type: route.containerTypes.join(', '),
+          valid_range: [dayjs(route.validFrom || undefined), dayjs(route.validTo || undefined)],
+          notes: '',
+          items: allItems.map(item => ({
+            carrier_name: item.carrier_name,
+            vessel_voyage: item.vessel_voyage,
+            freight_rate: item.freight_rate,
+            cost_freight: item.cost_freight || 0,
+            transit_days: item.transit_days || '',
+            supplier_name: item.supplier_name || '',
+            supplier_contact: item.supplier_contact || '',
+            remarks: item.remarks || '',
+            _batchId: item._batchId,
+            _containerType: item._containerType,
+            _itemId: item.id,
+          })),
+        });
+      };
+
+      setTimeout(populateForm, 50);
+    } catch (err) {
+      message.error('加载航线数据失败: ' + err.message);
+    }
+  };
+
+  const handleRouteDelete = async (route) => {
+    try {
+      const ids = (route.children || []).map(b => b.id);
+      await shippingRatesAPI.deleteBatches(ids);
+      message.success(`已删除航线 ${route.pol}→${route.pod} 下的 ${ids.length} 个批次`);
+      fetchBatches();
+    } catch (err) {
+      message.error('删除失败: ' + err.message);
     }
   };
 
@@ -248,45 +444,35 @@ function ShippingRates() {
 
   // ==================== 表格列定义 ====================
 
-  const batchColumns = [
-    { title: 'ID', dataIndex: 'id', width: 60 },
-    { title: '起运港', dataIndex: 'pol', width: 100, render: v => <Tag color="blue">{v}</Tag> },
-    { title: '目的港', dataIndex: 'pod', width: 100, render: v => <Tag color="green">{v}</Tag> },
-    { title: '箱型', dataIndex: 'container_type', width: 80, render: v => <Tag>{v}</Tag> },
+  const routeColumns = [
+    { title: '起运港', dataIndex: 'pol', width: 90, render: v => <Tag color="blue">{v}</Tag> },
+    { title: '目的港', dataIndex: 'pod', width: 90, render: v => <Tag color="green">{v}</Tag> },
     {
       title: '有效期', key: 'valid', width: 180,
-      render: (_, r) => `${r.valid_from || '-'} ~ ${r.valid_to || '-'}`,
+      render: (_, r) => `${r.validFrom || '-'} ~ ${r.validTo || '-'}`,
     },
+    { title: '批次', key: 'count', width: 60, align: 'center', render: (_, r) => <Text strong>{(r.children || []).length}</Text> },
     {
       title: '状态', dataIndex: 'status', width: 80,
       render: v => v === 'active' ? <Tag color="green" icon={<CheckCircleOutlined />}>有效</Tag> : <Tag color="default" icon={<MinusCircleOutlined />}>过期</Tag>,
     },
-    { title: '报价数', dataIndex: 'item_count', width: 70, align: 'center' },
-    { title: '录入人', dataIndex: 'created_by_name', width: 80 },
-    { title: '备注', dataIndex: 'notes', ellipsis: true, width: 150 },
+    { title: '录入人', dataIndex: 'createdByName', width: 80 },
     {
-      title: '操作', key: 'actions', width: 280, fixed: 'right',
+      title: '操作', key: 'actions', width: 200, fixed: 'right',
       render: (_, r) => (
-        <Space size="small">
-          <Tooltip title="查看详情"><Button type="link" size="small" icon={<EyeOutlined />} onClick={async () => {
-            try {
-              const res = await shippingRatesAPI.getBatch(r.id);
-              setDetailData(res);
-              setDetailVisible(true);
-            } catch (_) {}
-          }} /></Tooltip>
-          <Tooltip title="编辑"><Button type="link" size="small" icon={<EditOutlined />} onClick={() => handleEdit(r)} /></Tooltip>
-          <Tooltip title="导出Excel"><Button type="link" size="small" icon={<DownloadOutlined />} onClick={() => shippingRatesAPI.exportBatch(r.id)} /></Tooltip>
-          {r.status === 'active' ? (
-            <Popconfirm title="确认设为过期？" onConfirm={() => handleStatus(r.id, 'expired')}>
-              <Button type="link" size="small" danger>过期</Button>
-            </Popconfirm>
-          ) : (
-            <Popconfirm title="确认重新激活？" onConfirm={() => handleStatus(r.id, 'active')}>
-              <Button type="link" size="small">激活</Button>
-            </Popconfirm>
-          )}
-          <Popconfirm title="确认删除？" onConfirm={() => handleDelete(r.id)}>
+        <Space size={2}>
+          <Tooltip title="查看批次"><Button type="link" size="small" icon={<EyeOutlined />} onClick={() => setSubBatchRoute(r)} /></Tooltip>
+          <Tooltip title="编辑航线"><Button type="link" size="small" icon={<EditOutlined />} onClick={() => handleRouteEdit(r)} /></Tooltip>
+          <Dropdown menu={{
+            items: [
+              { key: 'export', icon: <DownloadOutlined />, label: '导出整条航线', onClick: () => (r.children || []).forEach(b => shippingRatesAPI.exportBatch(b.id)) },
+              { type: 'divider' },
+              ...(r.status === 'active' ? [{ key: 'expire', label: '整条设为过期', danger: true, onClick: () => (r.children || []).forEach(b => handleStatus(b.id, 'expired')) }] : [{ key: 'activate', label: '整条重新激活', onClick: () => (r.children || []).forEach(b => handleStatus(b.id, 'active')) }]),
+            ],
+          }} trigger={['click']}>
+            <Button type="link" size="small" icon={<MoreOutlined />} />
+          </Dropdown>
+          <Popconfirm title={`确认删除 ${r.pol}→${r.pod} 下全部 ${(r.children || []).length} 个批次？`} onConfirm={() => handleRouteDelete(r)}>
             <Button type="link" size="small" danger icon={<DeleteOutlined />} />
           </Popconfirm>
         </Space>
@@ -298,6 +484,13 @@ function ShippingRates() {
     { title: '船公司', dataIndex: 'carrier_name', width: 100, render: v => <Tag color="blue">{v}</Tag> },
     { title: '船名航次', dataIndex: 'vessel_voyage', width: 180 },
     { title: '海运费(USD)', dataIndex: 'freight_rate', width: 120, align: 'right', render: v => v ? <Text strong style={{ color: '#cf1322' }}>$ {v.toLocaleString()}</Text> : '-' },
+    ...(isAdmin ? [
+      { title: '成本(USD)', dataIndex: 'cost_freight', width: 110, align: 'right', render: v => v ? <Text type="secondary">$ {v.toLocaleString()}</Text> : '-' },
+      { title: '利润(USD)', key: 'profit', width: 110, align: 'right', render: (_, r) => {
+        const p = (r.freight_rate || 0) - (r.cost_freight || 0);
+        return p !== 0 ? <Text strong style={{ color: p > 0 ? '#3f8600' : '#cf1322' }}>{p > 0 ? '+' : ''}$ {p.toLocaleString()}</Text> : '-';
+      }},
+    ] : []),
     { title: '航程天数', dataIndex: 'transit_days', width: 90, render: v => v ? <Tag color="purple">{v}</Tag> : '-' },
     { title: '订舱口', dataIndex: 'supplier_name', width: 100 },
     { title: '联系人', dataIndex: 'supplier_contact', width: 80 },
@@ -432,36 +625,83 @@ function ShippingRates() {
                   <div>暂无有效报价数据，请联系商务录入</div>
                 </div>
               ) : (
-                activeRates.map(batch => (
-                  <Card
-                    key={batch.id}
-                    size="small"
-                    title={
-                      <Space>
-                        <Tag color="blue">{batch.pol}</Tag>
-                        <span>→</span>
-                        <Tag color="green">{batch.pod}</Tag>
-                        <Tag>{batch.container_type}</Tag>
-                        <Text type="secondary">{batch.valid_from} ~ {batch.valid_to}</Text>
-                        {batch.notes && <Tag color="orange">{batch.notes}</Tag>}
-                      </Space>
-                    }
-                    style={{ marginBottom: 16 }}
-                  >
-                    <Table
-                      dataSource={batch.items || []}
-                      columns={getRateColumns(batch.id)}
-                      rowKey="id"
-                      pagination={false}
-                      size="small"
-                    />
-                  </Card>
-                ))
+                (() => {
+                  const polMap = {};
+                  activeRates.forEach(b => {
+                    if (!polMap[b.pol]) polMap[b.pol] = [];
+                    polMap[b.pol].push(b);
+                  });
+                  const pols = Object.keys(polMap);
+                  const currentPol = activePolTab && pols.includes(activePolTab) ? activePolTab : pols[0] || '';
+                  const items = currentPol ? (polMap[currentPol] || []) : [];
+                  const podMap = {};
+                  items.forEach(b => {
+                    if (!podMap[b.pod]) podMap[b.pod] = [];
+                    podMap[b.pod].push(b);
+                  });
+
+                  return (
+                    <>
+                      <Tabs
+                        activeKey={currentPol}
+                        onChange={setActivePolTab}
+                        type="card"
+                        size="small"
+                        style={{ marginBottom: 12 }}
+                        items={pols.map(pol => ({ key: pol, label: <Space size={4}><Tag color="blue" style={{ margin: 0 }}>{pol}</Tag><Text type="secondary" style={{ fontSize: 12 }}>{polMap[pol].length}港</Text></Space> }))}
+                      />
+                      {Object.entries(podMap).map(([pod, batches]) => (
+                        <Card
+                          key={pod}
+                          size="small"
+                          style={{ marginBottom: 12 }}
+                          title={
+                            <Space size={8} wrap>
+                              <Tag color="green" style={{ fontSize: 14, padding: '2px 10px' }}>{pod}</Tag>
+                              {[...new Set(batches.map(b => b.container_type))].map(ct => (
+                                <Tag key={ct}>{ct}</Tag>
+                              ))}
+                              <Text type="secondary" style={{ fontSize: 12 }}>{batches.length} 个批次</Text>
+                            </Space>
+                          }
+                        >
+                          <Table
+                            dataSource={batches.flatMap(b => (b.items || []).map(item => ({ ...item, _batchId: b.id, _containerType: b.container_type, _validFrom: b.valid_from, _validTo: b.valid_to, _notes: b.notes })))}
+                            columns={[
+                              { title: '船公司', dataIndex: 'carrier_name', width: 100, render: v => <Tag color="blue">{v}</Tag> },
+                              { title: '箱型', dataIndex: '_containerType', width: 70, render: v => <Tag>{v}</Tag> },
+                              { title: '船名航次', dataIndex: 'vessel_voyage', width: 170 },
+                              { title: '海运费(USD)', dataIndex: 'freight_rate', width: 120, align: 'right', render: v => v ? <Text strong style={{ color: '#cf1322' }}>$ {v.toLocaleString()}</Text> : '-' },
+                              ...(isAdmin ? [
+                                { title: '成本(USD)', dataIndex: 'cost_freight', width: 100, align: 'right', render: v => v ? <Text type="secondary">$ {v.toLocaleString()}</Text> : '-' },
+                                { title: '利润(USD)', key: 'profit', width: 100, align: 'right', render: (_, r) => {
+                                  const p = (r.freight_rate || 0) - (r.cost_freight || 0);
+                                  return p !== 0 ? <Text strong style={{ color: p > 0 ? '#3f8600' : '#cf1322' }}>{p > 0 ? '+' : ''}$ {p.toLocaleString()}</Text> : '-';
+                                }},
+                              ] : []),
+                              { title: '航程', dataIndex: 'transit_days', width: 70, render: v => v ? <Tag color="purple">{v}</Tag> : '-' },
+                              { title: '订舱口', dataIndex: 'supplier_name', width: 90 },
+                              { title: '备注', dataIndex: 'remarks', width: 100, render: v => v ? <Tag color="orange">{v}</Tag> : '-' },
+                              {
+                                title: '操作', key: 'act', width: 70,
+                                render: (_, r) => <Button type="link" size="small" icon={<DollarOutlined />} onClick={() => handlePreviewQuotation(r._batchId, r.id)}>报价单</Button>,
+                              },
+                            ]}
+                            rowKey={(r) => `${r._batchId}_${r.id}`}
+                            pagination={false}
+                            size="small"
+                            loading={rateLoading}
+                          />
+                        </Card>
+                      ))}
+                    </>
+                  );
+                })()
               )}
             </Card>
           ),
         },
-        {
+        ...(isAdmin ? [{
           key: 'batches',
           label: <span><HistoryOutlined /> 报价批次管理</span>,
           children: (
@@ -487,6 +727,15 @@ function ShippingRates() {
                 </Col>
                 <Col>
                   <Space>
+                    <Popconfirm
+                      title={selectedRowKeys.length > 0 ? `确认删除选中的 ${selectedRowKeys.length} 个批次？` : ''}
+                      onConfirm={handleBatchDelete}
+                      disabled={selectedRowKeys.length === 0}
+                    >
+                      <Button danger icon={<DeleteOutlined />} disabled={selectedRowKeys.length === 0}>
+                        批量删除{selectedRowKeys.length > 0 ? `(${selectedRowKeys.length})` : ''}
+                      </Button>
+                    </Popconfirm>
                     <Upload accept=".xlsx,.xls" showUploadList={false} beforeUpload={handleImport}>
                       <Button icon={<UploadOutlined />} loading={importing}>导入Excel</Button>
                     </Upload>
@@ -497,24 +746,128 @@ function ShippingRates() {
                 </Col>
               </Row>
 
-              <Table
-                dataSource={batches}
-                columns={batchColumns}
-                rowKey="id"
-                loading={loading}
-                scroll={{ x: 1100 }}
-                pagination={{
-                  current: params.page,
-                  pageSize: params.pageSize,
-                  total,
-                  showSizeChanger: true,
-                  showTotal: t => `共 ${t} 条`,
-                  onChange: (page, pageSize) => setParams(prev => ({ ...prev, page, pageSize })),
-                }}
-              />
+              {batches.length === 0 ? (
+                <div style={{ textAlign: 'center', padding: 60, color: '#999' }}>
+                  <FileExcelOutlined style={{ fontSize: 48, marginBottom: 16 }} />
+                  <div>暂无报价批次，请新增或导入</div>
+                </div>
+              ) : (
+                (() => {
+                  const routeMap = {};
+                  batches.forEach(b => {
+                    if (!b.pol || !b.pod || !b.valid_from || !b.valid_to) return;
+                    const key = `${b.pol}\x00${b.pod}`;
+                    if (!routeMap[key]) {
+                      routeMap[key] = { pol: b.pol, pod: b.pod, validFrom: b.valid_from, validTo: b.valid_to, status: b.status, createdByName: b.created_by_name, containerTypes: [], children: [] };
+                    }
+                    routeMap[key].children.push(b);
+                    if (!routeMap[key].containerTypes.includes(b.container_type)) {
+                      routeMap[key].containerTypes.push(b.container_type);
+                    }
+                    if (b.valid_from < routeMap[key].validFrom) routeMap[key].validFrom = b.valid_from;
+                    if (b.valid_to > routeMap[key].validTo) routeMap[key].validTo = b.valid_to;
+                  });
+                  const routes = Object.values(routeMap).filter(r => r.children && r.children.length > 0);
+
+                  return (
+                    <Table
+                      key={`${params.page}-${params.search}-${params.status}`}
+                      dataSource={routes}
+                      columns={routeColumns}
+                      rowKey={(r) => `route-${r.pol}|${r.pod}`}
+                      loading={loading}
+                      size="small"
+                      pagination={false}
+                      rowSelection={{ selectedRowKeys, onChange: setSelectedRowKeys, columnWidth: 45 }}
+                      className="shipping-routes-table"
+                    />
+                  );
+                })()
+              )}
+
+              <div style={{ marginTop: 16, textAlign: 'right' }}>
+                <Space>
+                  <Text type="secondary">共 {total} 个批次</Text>
+                  <Select
+                    value={params.pageSize}
+                    onChange={(v) => setParams(prev => ({ ...prev, pageSize: v, page: 1 }))}
+                    options={[10, 20, 50, 100].map(v => ({ label: `${v}条/页`, value: v }))}
+                    style={{ width: 100 }}
+                  />
+                  <Pagination
+                    current={params.page}
+                    total={total}
+                    pageSize={params.pageSize}
+                    showQuickJumper
+                    showSizeChanger={false}
+                    onChange={(page) => setParams(prev => ({ ...prev, page }))}
+                  />
+                </Space>
+              </div>
+
+              <Drawer
+                title={subBatchRoute ? `航线 ${subBatchRoute.pol} → ${subBatchRoute.pod}` : ''}
+                open={!!subBatchRoute}
+                onClose={() => setSubBatchRoute(null)}
+                width={850}
+              >
+                {subBatchRoute && (
+                  <Spin spinning={subBatchLoading}>
+                    {(subBatchRoute.children || []).map((b) => {
+                      const items = subBatchItems[b.id] || [];
+                      return (
+                        <Card
+                          key={b.id}
+                          size="small"
+                          style={{ marginBottom: 12 }}
+                          title={
+                            <Space size={8}>
+                              <Tag>{b.container_type}</Tag>
+                              <span style={{ fontSize: 12, color: '#666' }}>{b.valid_from || '-'} ~ {b.valid_to || '-'}</span>
+                              <Tag color={b.status === 'active' ? 'green' : 'default'}>{b.status === 'active' ? '有效' : '过期'}</Tag>
+                              <span style={{ fontSize: 12, color: '#999' }}>共 {b.item_count || 0} 条报价</span>
+                            </Space>
+                          }
+                          extra={
+                            <Space size={2}>
+                              <Tooltip title="编辑"><Button type="link" size="small" icon={<EditOutlined />} onClick={() => { setSubBatchRoute(null); handleEdit(b); }} /></Tooltip>
+                              <Popconfirm title="确认删除？" onConfirm={() => handleDelete(b.id)}>
+                                <Button type="link" size="small" danger icon={<DeleteOutlined />} />
+                              </Popconfirm>
+                            </Space>
+                          }
+                        >
+                          {items.length === 0 ? (
+                            <div style={{ textAlign: 'center', color: '#999', padding: 12 }}>暂无报价明细</div>
+                          ) : (
+                            <Table
+                              dataSource={items}
+                              rowKey="id"
+                              size="small"
+                              pagination={false}
+                              columns={[
+                                { title: '船公司', dataIndex: 'carrier_name', width: 80, render: v => <Tag color="blue">{v}</Tag> },
+                                { title: '船名航次', dataIndex: 'vessel_voyage', width: 140 },
+                                { title: '海运费(USD)', dataIndex: 'freight_rate', width: 110, align: 'right', render: v => v ? <Text strong style={{ color: '#cf1322' }}>$ {v.toLocaleString()}</Text> : '-' },
+                                ...(isAdmin ? [
+                                  { title: '成本(USD)', dataIndex: 'cost_freight', width: 100, align: 'right', render: v => v ? <Text type="secondary">$ {v.toLocaleString()}</Text> : '-' },
+                                ] : []),
+                                { title: '航程', dataIndex: 'transit_days', width: 60, render: v => v ? <Tag color="purple">{v}</Tag> : '-' },
+                                { title: '订舱口', dataIndex: 'supplier_name', width: 80 },
+                                { title: '备注', dataIndex: 'remarks', width: 100, render: v => v || '-' },
+                              ]}
+                            />
+                          )}
+                        </Card>
+                      );
+                    })}
+                  </Spin>
+                )}
+              </Drawer>
             </Card>
           ),
         },
+      ] : []),
       ]} />
 
       {/* ==================== 新增/编辑弹窗 ==================== */}
@@ -523,25 +876,36 @@ function ShippingRates() {
         open={modalVisible}
         width={900}
         onOk={handleSave}
-        onCancel={() => setModalVisible(false)}
+        onCancel={() => { setModalVisible(false); setEditingRoute(null); }}
         confirmLoading={saving}
-        destroyOnClose
       >
         <Form form={form} layout="vertical">
           <Row gutter={16}>
             <Col span={6}>
               <Form.Item name="pol" label="起运港" rules={[{ required: true, message: '必填' }]}>
-                <Input placeholder="如：宁波" />
+                {editingRoute ? (
+                  <Input disabled style={{ background: '#f5f5f5' }} />
+                ) : (
+                  <Input placeholder="如：宁波" />
+                )}
               </Form.Item>
             </Col>
             <Col span={6}>
               <Form.Item name="pod" label="目的港" rules={[{ required: true, message: '必填' }]}>
-                <Input placeholder="如：长滩" />
+                {editingRoute ? (
+                  <Input disabled style={{ background: '#f5f5f5' }} />
+                ) : (
+                  <Input placeholder="如：长滩" />
+                )}
               </Form.Item>
             </Col>
             <Col span={6}>
               <Form.Item name="container_type" label="箱型" rules={[{ required: true, message: '必填' }]}>
-                <Select placeholder="选择箱型" options={['20GP', '40GP', '40HQ', '45HQ'].map(t => ({ label: t, value: t }))} />
+                {editingRoute ? (
+                  <Input disabled style={{ background: '#f5f5f5' }} />
+                ) : (
+                  <Select placeholder="选择箱型" options={['20GP', '40GP', '40HQ', '45HQ'].map(t => ({ label: t, value: t }))} />
+                )}
               </Form.Item>
             </Col>
             <Col span={6}>
@@ -555,14 +919,16 @@ function ShippingRates() {
           </Form.Item>
 
           <div style={{ marginBottom: 8, fontWeight: 'bold' }}>报价明细</div>
-          <Form.List name="items" initialValue={[{ carrier_name: '', vessel_voyage: '', freight_rate: '', transit_days: '', supplier_name: '', supplier_contact: '', remarks: '' }]}>
+          <Form.List name="items" initialValue={[{ carrier_name: '', vessel_voyage: '', freight_rate: '', cost_freight: '', transit_days: '', supplier_name: '', supplier_contact: '', remarks: '' }]}>
             {(fields, { add, remove }) => (
               <>
                 <div style={{ display: 'flex', gap: 8, marginBottom: 8, fontWeight: 500, fontSize: 12, color: '#888' }}>
+                  {editingRoute && <div style={{ flex: 0.7 }}>箱型</div>}
                   <div style={{ flex: 1 }}>船公司</div>
                   <div style={{ flex: 1.5 }}>船名航次</div>
-                  <div style={{ flex: 1 }}>海运费(USD)</div>
-                  <div style={{ flex: 0.7 }}>航程天数</div>
+                  <div style={{ flex: 1 }}>海运费</div>
+                  <div style={{ flex: 0.9 }}>成本</div>
+                  <div style={{ flex: 0.7 }}>航程</div>
                   <div style={{ flex: 1 }}>订舱口</div>
                   <div style={{ flex: 0.7 }}>联系人</div>
                   <div style={{ flex: 1 }}>备注</div>
@@ -570,6 +936,29 @@ function ShippingRates() {
                 </div>
                 {fields.map(({ key, name, ...rest }) => (
                   <div key={key} style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
+                    {editingRoute && (
+                      <>
+                        <Form.Item {...rest} name={[name, '_containerType']} style={{ flex: 0.7, marginBottom: 0 }} hidden>
+                          <Input />
+                        </Form.Item>
+                        <Form.Item {...rest} name={[name, '_batchId']} style={{ marginBottom: 0 }} hidden>
+                          <InputNumber />
+                        </Form.Item>
+                        <Form.Item {...rest} name={[name, '_itemId']} style={{ marginBottom: 0 }} hidden>
+                          <InputNumber />
+                        </Form.Item>
+                        <Form.Item noStyle shouldUpdate>
+                          {() => {
+                            const ct = form.getFieldValue(['items', name, '_containerType']);
+                            return (
+                              <div style={{ flex: 0.7, paddingTop: 4 }}>
+                                <Tag>{ct || '-'}</Tag>
+                              </div>
+                            );
+                          }}
+                        </Form.Item>
+                      </>
+                    )}
                     <Form.Item {...rest} name={[name, 'carrier_name']} style={{ flex: 1, marginBottom: 0 }} rules={[{ required: true, message: '必选' }]}>
                       <Select placeholder="船公司" options={CARRIER_OPTIONS} showSearch allowClear />
                     </Form.Item>
@@ -577,7 +966,10 @@ function ShippingRates() {
                       <Input placeholder="船名航次" />
                     </Form.Item>
                     <Form.Item {...rest} name={[name, 'freight_rate']} style={{ flex: 1, marginBottom: 0 }} rules={[{ required: true, message: '必填' }]}>
-                      <InputNumber placeholder="海运费" min={0} style={{ width: '100%' }} />
+                      <InputNumber placeholder="售价" min={0} style={{ width: '100%' }} />
+                    </Form.Item>
+                    <Form.Item {...rest} name={[name, 'cost_freight']} style={{ flex: 0.9, marginBottom: 0 }}>
+                      <InputNumber placeholder="成本" min={0} style={{ width: '100%' }} />
                     </Form.Item>
                     <Form.Item {...rest} name={[name, 'transit_days']} style={{ flex: 0.7, marginBottom: 0 }}>
                       <Input placeholder="如14+" />
@@ -594,7 +986,7 @@ function ShippingRates() {
                     <Button type="text" danger icon={<DeleteOutlined />} onClick={() => remove(name)} style={{ marginTop: 5 }} disabled={fields.length === 1} />
                   </div>
                 ))}
-                <Button type="dashed" onClick={() => add({ carrier_name: '', vessel_voyage: '', freight_rate: '', transit_days: '', supplier_name: '', supplier_contact: '', remarks: '' })} block icon={<PlusOutlined />}>
+                <Button type="dashed" onClick={() => add({ carrier_name: '', vessel_voyage: '', freight_rate: '', cost_freight: '', transit_days: '', supplier_name: '', supplier_contact: '', remarks: '' })} block icon={<PlusOutlined />}>
                   添加航司报价
                 </Button>
               </>
@@ -631,6 +1023,13 @@ function ShippingRates() {
                 { title: '船公司', dataIndex: 'carrier_name', width: 100, render: v => <Tag color="blue">{v}</Tag> },
                 { title: '船名航次', dataIndex: 'vessel_voyage', width: 180 },
                 { title: '海运费(USD)', dataIndex: 'freight_rate', width: 120, align: 'right', render: v => v ? <Text strong style={{ color: '#cf1322' }}>$ {v.toLocaleString()}</Text> : '-' },
+                ...(isAdmin ? [
+                  { title: '成本(USD)', dataIndex: 'cost_freight', width: 100, align: 'right', render: v => v ? <Text type="secondary">$ {v.toLocaleString()}</Text> : '-' },
+                  { title: '利润(USD)', key: 'profit', width: 100, align: 'right', render: (_, r) => {
+                    const p = (r.freight_rate || 0) - (r.cost_freight || 0);
+                    return p !== 0 ? <Text strong style={{ color: p > 0 ? '#3f8600' : '#cf1322' }}>{p > 0 ? '+' : ''}$ {p.toLocaleString()}</Text> : '-';
+                  }},
+                ] : []),
                 { title: '航程天数', dataIndex: 'transit_days', width: 90, render: v => v ? <Tag color="purple">{v}</Tag> : '-' },
                 { title: '订舱口', dataIndex: 'supplier_name', width: 100 },
                 { title: '联系人', dataIndex: 'supplier_contact', width: 80 },
@@ -761,6 +1160,10 @@ function ShippingRates() {
           </div>
         ) : null}
       </Modal>
+      <style>{`
+        .shipping-routes-table .ant-table-expand-icon-col,
+        .shipping-routes-table .ant-table-row-expand-icon { display: none !important; }
+      `}</style>
     </div>
   );
 }

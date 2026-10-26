@@ -562,6 +562,37 @@ function createTables() {
   try { db.exec('ALTER TABLE call_logs ADD COLUMN file_url TEXT DEFAULT ""'); } catch {}
   try { db.exec('ALTER TABLE feedback_summaries ADD COLUMN file_url TEXT DEFAULT ""'); } catch {}
   try { db.exec("ALTER TABLE shipping_rate_items ADD COLUMN transit_days TEXT DEFAULT ''"); } catch {}
+  try { db.exec("ALTER TABLE shipping_rate_items ADD COLUMN cost_freight REAL DEFAULT 0"); } catch {}
+  try { db.exec("ALTER TABLE users ADD COLUMN wechat_openid TEXT"); } catch {}
+
+  // === 费用明细模板 ===
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS fee_templates (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      is_default INTEGER DEFAULT 0,
+      created_by INTEGER REFERENCES users(id),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_fee_templates_default ON fee_templates(is_default);
+
+    CREATE TABLE IF NOT EXISTS fee_template_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      template_id INTEGER NOT NULL REFERENCES fee_templates(id) ON DELETE CASCADE,
+      sort_order INTEGER DEFAULT 0,
+      item_name TEXT NOT NULL,
+      standard TEXT DEFAULT '按每柜计费',
+      amount_type TEXT DEFAULT 'fixed',
+      amount_value TEXT DEFAULT '',
+      currency TEXT DEFAULT 'USD',
+      note TEXT DEFAULT '',
+      category TEXT DEFAULT 'fee'
+    );
+    CREATE INDEX IF NOT EXISTS idx_fee_template_items_tpl ON fee_template_items(template_id);
+  `);
+
+  try { db.exec("ALTER TABLE fee_template_items ADD COLUMN category TEXT DEFAULT 'fee'"); } catch {}
 
   try {
     const roles = db.prepare('SELECT id FROM roles').all();
@@ -770,6 +801,16 @@ export const UserOps = {
     const hashed = bcrypt.hashSync(newPassword, 10);
     db.prepare('UPDATE users SET password = ? WHERE id = ?').run(hashed, id);
     return true;
+  },
+  findByWechatOpenid(openid) {
+    if (!openid) return null;
+    return db.prepare('SELECT * FROM users WHERE wechat_openid = ?').get(openid) || null;
+  },
+  bindWechatOpenid(userId, openid) {
+    const existing = db.prepare('SELECT id FROM users WHERE wechat_openid = ? AND id != ?').get(openid, userId);
+    if (existing) return { success: false, error: '该微信已被其他账号绑定' };
+    db.prepare('UPDATE users SET wechat_openid = ? WHERE id = ?').run(openid, userId);
+    return { success: true };
   },
 };
 

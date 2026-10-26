@@ -2,6 +2,7 @@
 // 美鸥国际物流 CRM - Express 服务器入口
 import 'dotenv/config';
 import express from 'express';
+import compression from 'compression';
 import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -23,6 +24,7 @@ import wcfBotRoutes from './routes/wcf-bot.js';
 import salesRoutes from './routes/sales/index.js';
 import trackingRoutes from '../trajectory/tracking.js';
 import shippingRatesRoutes from './routes/shipping-rates.js';
+import feeTemplatesRoutes from './routes/fee-templates.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -32,6 +34,7 @@ const PORT = process.env.PORT || 3001;
 initDatabase();
 
 // 中间件
+app.use(compression()); // gzip 压缩，解决低带宽下加载慢的问题
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 app.use(auditMiddleware);
@@ -52,6 +55,7 @@ app.use('/rpa', botRoutes);
 app.use('/api/sales', salesRoutes);
 app.use('/api/tracking', trackingRoutes);
 app.use('/api/shipping-rates', shippingRatesRoutes);
+app.use('/api/fee-templates', feeTemplatesRoutes);
 app.use('/api/bot/wcf', wcfBotRoutes);
 
 // 上传文件静态服务（支持直接打开/预览）

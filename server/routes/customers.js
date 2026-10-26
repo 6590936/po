@@ -23,7 +23,10 @@ router.get('/', (req, res) => {
   if (req.user.role !== 'admin') {
     where.owner_id = req.user.id;
   } else if (ownerId) {
-    where.owner_id = parseInt(ownerId);
+    const parsed = parseInt(ownerId, 10);
+    if (!isNaN(parsed) && parsed > 0) {
+      where.owner_id = parsed;
+    }
   }
 
   const result = CustomerOps.findAll({

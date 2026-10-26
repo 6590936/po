@@ -146,6 +146,96 @@ router.put('/users/:id/reset-password', authenticateToken, requireAdmin, (req, r
   }
 });
 
+// 微信小程序登录
+router.post('/wechat-login', async (req, res) => {
+  const { code } = req.body;
+  if (!code) {
+    return res.status(400).json({ error: '缺少微信授权code' });
+  }
+
+  const appId = process.env.WECHAT_APP_ID || 'wx9b96062cc023ebc9';
+  const appSecret = process.env.WECHAT_APP_SECRET || '0c72def863aa1b55f749387d02b4adf3';
+
+  try {
+    const https = await import('https');
+    const wxUrl = `https://api.weixin.qq.com/sns/jscode2session?appid=${appId}&secret=${appSecret}&js_code=${code}&grant_type=authorization_code`;
+
+    const wxData = await new Promise((resolve, reject) => {
+      https.get(wxUrl, (resp) => {
+        let data = '';
+        resp.on('data', (chunk) => { data += chunk; });
+        resp.on('end', () => {
+          try { resolve(JSON.parse(data)); } catch (e) { reject(e); }
+        });
+      }).on('error', reject);
+    });
+
+    if (wxData.errcode) {
+      console.error('微信登录失败:', wxData);
+      return res.status(400).json({ error: `微信授权失败: ${wxData.errmsg || '未知错误'}` });
+    }
+
+    const openid = wxData.openid;
+    const user = UserOps.findByWechatOpenid(openid);
+    if (!user) {
+      return res.json({
+        needBind: true,
+        openid,
+        message: '该微信未绑定CRM账号，请先用账号密码登录后绑定',
+      });
+    }
+
+    const token = jwt.sign(
+      { id: user.id, username: user.username, name: user.name, role: user.role },
+      JWT_SECRET,
+      { expiresIn: TOKEN_EXPIRY }
+    );
+
+    logAudit({
+      user_id: user.id,
+      username: user.username,
+      action: 'WECHAT_LOGIN',
+      target_type: 'user',
+      target_id: user.id,
+      ip_address: req.ip || req.connection?.remoteAddress || null,
+    });
+
+    res.json({
+      token,
+      user: {
+        id: user.id, username: user.username, name: user.name, role: user.role,
+        menus: RoleOps.getUserMenus(user.role),
+        permissions: RoleOps.getUserPermissions(user.role),
+      },
+    });
+  } catch (err) {
+    console.error('微信登录异常:', err);
+    res.status(500).json({ error: '微信登录失败，请重试' });
+  }
+});
+
+// 绑定微信openid（需要已登录）
+router.post('/bind-wechat', authenticateToken, (req, res) => {
+  const { openid } = req.body;
+  if (!openid) {
+    return res.status(400).json({ error: '缺少openid' });
+  }
+  const result = UserOps.bindWechatOpenid(req.user.id, openid);
+  if (result.success) {
+    logAudit({
+      user_id: req.user.id,
+      username: req.user.username,
+      action: 'BIND_WECHAT',
+      target_type: 'user',
+      target_id: req.user.id,
+      ip_address: req.ip || req.connection?.remoteAddress || null,
+    });
+    res.json({ message: '微信绑定成功' });
+  } else {
+    res.status(400).json({ error: result.error });
+  }
+});
+
 // JWT 认证中间件
 export function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];

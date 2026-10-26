@@ -2,12 +2,14 @@
 import React, { useState, useEffect } from 'react';
 import {
   Layout, Card, Table, Row, Col, Statistic, Input, Space, Button, Tag, Typography, message,
-  Drawer, Tabs, Form, Upload, Image, Divider, DatePicker, Descriptions,
+  Drawer, Modal, Tabs, Form, Upload, Image, Divider, DatePicker, Descriptions,
+  Select, Spin, Tooltip, Alert,
 } from 'antd';
 import {
   LogoutOutlined, DashboardOutlined, FileTextOutlined,
   SearchOutlined, EyeOutlined, GlobalOutlined,
-  UploadOutlined, UserOutlined, SaveOutlined,
+  UploadOutlined, UserOutlined, SaveOutlined, ReloadOutlined,
+  DollarOutlined, DownloadOutlined,
 } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
 import dayjs from 'dayjs';
@@ -29,9 +31,23 @@ function ClientPortal() {
   const [detailVisible, setDetailVisible] = useState(false);
   const [detailOrder, setDetailOrder] = useState(null);
   const [profileSaving, setProfileSaving] = useState(false);
-  const [activeTab, setActiveTab] = useState('orders');
+  const [activeTab, setActiveTab] = useState('shipping-rates');
   const [licensePreview, setLicensePreview] = useState(null);
   const [form] = Form.useForm();
+
+  const [rates, setRates] = useState([]);
+  const [rateLoading, setRateLoading] = useState(false);
+  const [rateError, setRateError] = useState('');
+  const [previewVisible, setPreviewVisible] = useState(false);
+  const [previewData, setPreviewData] = useState(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [filterPol, setFilterPol] = useState('');
+  const [filterPod, setFilterPod] = useState('');
+  const [filterType, setFilterType] = useState('');
+  const [polOptions, setPolOptions] = useState([]);
+  const [podOptions, setPodOptions] = useState([]);
+  const [typeOptions, setTypeOptions] = useState([]);
+  const [activePolTab, setActivePolTab] = useState('');
 
   const token = localStorage.getItem('client_token');
 
@@ -67,6 +83,13 @@ function ClientPortal() {
     fetchOrders();
     fetchProfile();
   }, []);
+
+  useEffect(() => {
+    if (activeTab === 'shipping-rates') {
+      fetchRateFilters();
+      fetchShippingRates();
+    }
+  }, [activeTab]);
 
   const fetchProfile = async () => {
     const data = await fetchWithAuth(`${BASE}/client/me`);
@@ -107,11 +130,81 @@ function ClientPortal() {
     fetchOrders(pag.current, pag.pageSize);
   };
 
+  const handlePreviewQuotation = async (batchId, itemId) => {
+    try {
+      setPreviewLoading(true);
+      setPreviewData(null);
+      setPreviewVisible(true);
+      const result = await fetchWithAuth(`${BASE}/client/shipping-rates/batches/${batchId}/quotation-preview?item_id=${itemId}`);
+      if (result?.data) setPreviewData(result.data);
+      else { message.error('数据格式错误'); setPreviewVisible(false); }
+    } catch (err) {
+      message.error(err.message || '预览失败');
+      setPreviewVisible(false);
+    } finally {
+      setPreviewLoading(false);
+    }
+  };
+
+  const handleDownloadExcel = async (batchId, itemId) => {
+    try {
+      message.loading({ content: '正在生成报价单...', key: 'quotation-dl', duration: 0 });
+      const resp = await fetch(`${BASE}/client/shipping-rates/batches/${batchId}/quotation?item_id=${itemId}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!resp.ok) {
+        const json = await resp.json();
+        throw new Error(json.error || '生成失败');
+      }
+      const blob = await resp.blob();
+      if (blob.size === 0) throw new Error('生成的文件为空');
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `报价单_${previewData?.carrier || '报价'}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      message.success({ content: '报价单已下载', key: 'quotation-dl', duration: 2 });
+    } catch (err) {
+      message.error({ content: err.message || '下载失败', key: 'quotation-dl', duration: 3 });
+    }
+  };
+
   const showDetail = async (record) => {
     const data = await fetchWithAuth(`${BASE}/client/orders/${record.job_id}`);
     if (data) {
       setDetailOrder(data);
       setDetailVisible(true);
+    }
+  };
+
+  const fetchRateFilters = async () => {
+    const data = await fetchWithAuth(`${BASE}/client/shipping-rates/filters`);
+    if (data) {
+      setPolOptions((data.pols || []).map(v => ({ label: v, value: v })));
+      setPodOptions((data.pods || []).map(v => ({ label: v, value: v })));
+      setTypeOptions((data.container_types || []).map(v => ({ label: v, value: v })));
+    }
+  };
+
+  const fetchShippingRates = async () => {
+    setRateLoading(true);
+    setRateError('');
+    try {
+      const params = new URLSearchParams();
+      if (filterPol) params.set('pol', filterPol);
+      if (filterPod) params.set('pod', filterPod);
+      if (filterType) params.set('container_type', filterType);
+      const data = await fetchWithAuth(`${BASE}/client/shipping-rates?${params}`);
+      if (data) {
+        setRates(data.data || []);
+      }
+    } catch (err) {
+      setRateError('加载失败：' + (err.message || '网络异常'));
+    } finally {
+      setRateLoading(false);
     }
   };
 
@@ -190,6 +283,119 @@ function ClientPortal() {
   ];
 
   const tabItems = [
+    {
+      key: 'shipping-rates',
+      label: <span><GlobalOutlined />海运报价</span>,
+      children: (
+        <Spin spinning={rateLoading} size="large">
+          {rateError ? (
+            <div style={{ textAlign: 'center', padding: 40 }}>
+              <Alert type="error" message={rateError} showIcon style={{ marginBottom: 12 }} />
+              <Button type="primary" icon={<ReloadOutlined />} onClick={() => fetchShippingRates()}>重试</Button>
+            </div>
+          ) : (
+            <Card>
+              <Row gutter={16} style={{ marginBottom: 16 }}>
+                <Col span={6}>
+                  <Select placeholder="起运港" allowClear style={{ width: '100%' }}
+                    value={filterPol || undefined}
+                    onChange={v => setFilterPol(v || '')}
+                    options={polOptions} />
+                </Col>
+                <Col span={6}>
+                  <Select placeholder="目的港" allowClear style={{ width: '100%' }}
+                    value={filterPod || undefined}
+                    onChange={v => setFilterPod(v || '')}
+                    options={podOptions} />
+                </Col>
+                <Col span={6}>
+                  <Select placeholder="箱型" allowClear style={{ width: '100%' }}
+                    value={filterType || undefined}
+                    onChange={v => setFilterType(v || '')}
+                    options={typeOptions} />
+                </Col>
+                <Col span={6}>
+                  <Button icon={<ReloadOutlined />} onClick={fetchShippingRates}>刷新</Button>
+                </Col>
+              </Row>
+
+              {rates.length === 0 ? (
+                <div style={{ textAlign: 'center', padding: 60, color: '#999' }}>
+                  <GlobalOutlined style={{ fontSize: 48, marginBottom: 16 }} />
+                  <div>暂无有效报价数据</div>
+                </div>
+              ) : (
+                (() => {
+                  const polMap = {};
+                  rates.forEach(b => {
+                    if (!polMap[b.pol]) polMap[b.pol] = [];
+                    polMap[b.pol].push(b);
+                  });
+                  const pols = Object.keys(polMap);
+                  const currentPol = activePolTab && pols.includes(activePolTab) ? activePolTab : pols[0] || '';
+                  const items = currentPol ? (polMap[currentPol] || []) : [];
+                  const podMap = {};
+                  items.forEach(b => {
+                    if (!podMap[b.pod]) podMap[b.pod] = [];
+                    podMap[b.pod].push(b);
+                  });
+
+                  return (
+                    <>
+                      <Tabs
+                        activeKey={currentPol}
+                        onChange={setActivePolTab}
+                        type="card"
+                        size="small"
+                        style={{ marginBottom: 12 }}
+                        items={pols.map(pol => ({
+                          key: pol,
+                          label: <Space size={4}><Tag color="blue" style={{ margin: 0 }}>{pol}</Tag><Text type="secondary" style={{ fontSize: 12 }}>{polMap[pol].length}港</Text></Space>,
+                        }))}
+                      />
+                      {Object.entries(podMap).map(([pod, batches]) => (
+                        <Card
+                          key={pod}
+                          size="small"
+                          style={{ marginBottom: 12 }}
+                          title={
+                            <Space size={8} wrap>
+                              <Tag color="green" style={{ fontSize: 14, padding: '2px 10px' }}>{pod}</Tag>
+                              {[...new Set(batches.map(b => b.container_type))].map(ct => (
+                                <Tag key={ct}>{ct}</Tag>
+                              ))}
+                              <Text type="secondary" style={{ fontSize: 12 }}>{batches.length} 个批次</Text>
+                            </Space>
+                          }
+                        >
+                          <Table
+                            dataSource={batches.flatMap(b => (b.items || []).map(item => ({
+                              ...item, _containerType: b.container_type, _validFrom: b.valid_from, _validTo: b.valid_to, _notes: b.notes, _batchId: b.id,
+                            })))}
+                            rowKey={(r) => `${r.batch_id}_${r.id}`}
+                            pagination={false}
+                            size="small"
+                            columns={[
+                              { title: '船公司', dataIndex: 'carrier_name', width: 100, render: v => <Tag color="blue">{v}</Tag> },
+                              { title: '箱型', dataIndex: '_containerType', width: 70, render: v => <Tag>{v}</Tag> },
+                              { title: '船名航次', dataIndex: 'vessel_voyage', width: 170 },
+                              { title: '海运费(USD)', dataIndex: 'freight_rate', width: 120, align: 'right', render: v => v ? <Text strong style={{ color: '#cf1322' }}>$ {v.toLocaleString()}</Text> : '-' },
+                              { title: '航程', dataIndex: 'transit_days', width: 70, render: v => v ? <Tag color="purple">{v}天</Tag> : '-' },
+                              { title: '备注', dataIndex: 'remarks', width: 100, render: v => v ? <Tag color="orange">{v}</Tag> : '-' },
+                              { title: '操作', key: 'act', width: 80, render: (_, r) => <Button type="link" size="small" icon={<DollarOutlined />} onClick={() => handlePreviewQuotation(r._batchId, r.id)}>报价单</Button> },
+                            ]}
+                          />
+                        </Card>
+                      ))}
+                    </>
+                  );
+                })()
+              )}
+            </Card>
+          )}
+        </Spin>
+      ),
+    },
     {
       key: 'orders',
       label: <span><DashboardOutlined />我的订单</span>,
@@ -428,6 +634,79 @@ function ClientPortal() {
           </Descriptions>
         )}
       </Drawer>
+
+      <Modal
+        title={previewData ? `${previewData.carrier} - ${previewData.pol} → ${previewData.pod} (${previewData.ct}) 报价单预览` : '报价单预览'}
+        open={previewVisible}
+        onCancel={() => { setPreviewVisible(false); setPreviewData(null); }}
+        width={1100}
+        footer={[
+          <Button key="close" onClick={() => { setPreviewVisible(false); setPreviewData(null); }}>关闭</Button>,
+          <Button key="download" type="primary" icon={<DownloadOutlined />} onClick={() => {
+            if (previewData) handleDownloadExcel(previewData._batchId, previewData._itemId);
+          }}>下载 Excel</Button>,
+        ]}
+      >
+        {previewLoading ? (
+          <div style={{ textAlign: 'center', padding: 60 }}><Spin /></div>
+        ) : previewData ? (
+          <div style={{ background: '#fff' }}>
+            <div style={{ marginBottom: 16, padding: '12px 20px', background: '#1F4E79', color: '#fff', borderRadius: 6, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <Text strong style={{ fontSize: 15, color: '#fff' }}>费用明细</Text>
+              <Text style={{ color: '#FFD700', fontSize: 12 }}>说明：报价根据实际询价，关根据客户的产品名最终确认</Text>
+            </div>
+            <table style={{ width: '100%', borderCollapse: 'collapse', marginBottom: 24, fontSize: 13 }}>
+              <thead>
+                <tr>
+                  {['费用项目', '计费标准', '费用金额', '备注'].map(h => (
+                    <th key={h} style={{ border: '1px solid #d9d9d9', padding: '10px 12px', background: '#1F4E79', color: '#fff', fontWeight: 'bold', textAlign: 'center' }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {previewData.items.map((item, idx) => (
+                  <tr key={idx}>
+                    <td style={{ border: '1px solid #e8e8e8', padding: '8px 12px', fontWeight: idx === 0 ? 'bold' : 'normal', background: idx === 0 ? '#f0f7ff' : (idx === previewData.items.length - 1 ? '#fffbe6' : '#fff') }}>{item.name}</td>
+                    <td style={{ border: '1px solid #e8e8e8', padding: '8px 12px', textAlign: 'center' }}>{item.standard}</td>
+                    <td style={{ border: '1px solid #e8e8e8', padding: '8px 12px', textAlign: 'center', color: '#cf1322', fontWeight: 'bold' }}>{item.amount}</td>
+                    <td style={{ border: '1px solid #e8e8e8', padding: '8px 12px', fontSize: 12, lineHeight: 1.6, color: '#666' }}>{item.note}</td>
+                  </tr>
+                ))}
+                <tr style={{ background: '#fffbe6' }}>
+                  <td style={{ border: '1px solid #faad14', padding: '10px 12px', fontWeight: 'bold' }}>合计费用</td>
+                  <td style={{ border: '1px solid #faad14', padding: '10px 12px', textAlign: 'center', fontWeight: 'bold' }}>一票总计</td>
+                  <td colSpan="2" style={{ border: '1px solid #faad14', padding: '10px 12px', fontWeight: 'bold', color: '#cf1322', fontSize: 14 }}>
+                    USD {previewData.total.usd.toLocaleString()} + RMB {previewData.total.rmb.toLocaleString()}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+
+            <div style={{ marginBottom: 12, padding: '10px 20px', background: '#5B9BD5', color: '#fff', borderRadius: 6, fontWeight: 'bold', fontSize: 14, textAlign: 'center' }}>
+              尾程派送注意事项
+            </div>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+              <thead>
+                <tr>
+                  {['费用项目', '免费期', '超期标准', '备注'].map(h => (
+                    <th key={h} style={{ border: '1px solid #d9d9d9', padding: '8px 12px', background: '#5B9BD5', color: '#fff', fontWeight: 'bold', textAlign: 'center', fontSize: 12 }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {previewData.notes.map((note, idx) => (
+                  <tr key={idx}>
+                    <td style={{ border: '1px solid #e8e8e8', padding: '8px 12px' }}>{note.name}</td>
+                    <td style={{ border: '1px solid #e8e8e8', padding: '8px 12px', textAlign: 'center' }}>{note.free}</td>
+                    <td style={{ border: '1px solid #e8e8e8', padding: '8px 12px', textAlign: 'center', color: '#1890ff' }}>{note.fee}</td>
+                    <td style={{ border: '1px solid #e8e8e8', padding: '8px 12px', fontSize: 12, color: '#666', lineHeight: 1.5 }}>{note.note}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : null}
+      </Modal>
     </Layout>
   );
 }
