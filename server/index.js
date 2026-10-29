@@ -16,6 +16,7 @@ import quoteRoutes from './routes/quotes.js';
 import reportRoutes from './routes/reports.js';
 import yunwuyunRoutes from './routes/yunwuyun.js';
 import roleRoutes from './routes/roles.js';
+import tenantRoutes from './routes/tenants.js';
 import clientRoutes from './routes/client.js';
 import wechatRoutes from './routes/wechat.js';
 import wechatKfRoutes from './routes/wechat_kf.js';
@@ -48,6 +49,7 @@ app.use('/api/quotes', quoteRoutes);
 app.use('/api/reports', reportRoutes);
 app.use('/api/yunwuyun', yunwuyunRoutes);
 app.use('/api/roles', roleRoutes);
+app.use('/api/tenants', tenantRoutes);
 app.use('/api/client', clientRoutes);
 app.use('/api/wechat', wechatKfRoutes);  // 微信客服路由（放前面，避免被 wechatRoutes 的 authenticateToken 拦截）
 app.use('/api/wechat', wechatRoutes);

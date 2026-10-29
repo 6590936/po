@@ -33,6 +33,10 @@ function LayoutWrapper({ children }) {
   const [isMobile, setIsMobile] = useState(window.innerWidth <= 768);
 
   useEffect(() => {
+    document.title = user?.tenant_name ? `${user.tenant_name} - 客户管理系统` : '美鸥国际物流 - 客户管理系统';
+  }, [user?.tenant_name]);
+
+  useEffect(() => {
     const handleResize = () => setIsMobile(window.innerWidth <= 768);
     window.addEventListener('resize', handleResize);
     return () => window.removeEventListener('resize', handleResize);
@@ -97,7 +101,7 @@ function LayoutWrapper({ children }) {
     {
       key: '/admin',
       icon: <SettingOutlined />,
-      label: '系统管理',
+      label: '平台管理',
     },
   ].filter(item => user.menus?.includes(item.key));
 
@@ -159,7 +163,7 @@ function LayoutWrapper({ children }) {
               overflow: 'hidden',
             }}
           >
-            {collapsed ? 'MO' : '美鸥物流 CRM'}
+            {collapsed ? 'MO' : (user?.tenant_name || '美鸥物流 CRM')}
           </div>
           {siderContent}
         </Sider>
@@ -187,7 +191,7 @@ function LayoutWrapper({ children }) {
               borderBottom: '1px solid rgba(255,255,255,0.1)',
             }}
           >
-            美鸥物流 CRM
+            {user?.tenant_name || '美鸥物流 CRM'}
           </div>
           <Menu
             theme="dark"

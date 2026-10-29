@@ -6,9 +6,10 @@ import {
 } from 'antd';
 import {
   PlusOutlined, UserOutlined, TeamOutlined, DeleteOutlined,
-  LockOutlined, SafetyCertificateOutlined,
+  LockOutlined, SafetyCertificateOutlined, BankOutlined,
+  StopOutlined, CheckCircleOutlined,
 } from '@ant-design/icons';
-import { authAPI, customerAPI, roleAPI } from '../api';
+import { authAPI, customerAPI, roleAPI, tenantAPI } from '../api';
 import useAuthStore from '../store/authStore';
 
 const { Title } = Typography;
@@ -17,8 +18,8 @@ function Admin() {
   const user = useAuthStore((s) => s.user);
   const [activeTab, setActiveTab] = useState('users');
 
-  // 只有管理员能访问
-  if (user.role !== 'admin') {
+  // 只有角色拥有"平台管理"菜单权限的才能访问
+  if (!user.menus?.includes('/admin')) {
     return (
       <div style={{ textAlign: 'center', padding: 100 }}>
         <Title level={4} type="danger">无权访问此页面</Title>
@@ -26,13 +27,16 @@ function Admin() {
     );
   }
 
+  const isPlatformAdmin = !user.tenant_id && user.permissions?.includes('system:platform');
+
   return (
     <div>
       <Title level={4} style={{ marginBottom: 20 }}>系统管理</Title>
       <Tabs activeKey={activeTab} onChange={setActiveTab} items={[
+        isPlatformAdmin ? { key: 'tenants', label: <><BankOutlined /> 主体管理</>, children: <TenantManagement /> } : null,
         { key: 'users', label: <><TeamOutlined /> 用户管理</>, children: <UserManagement /> },
-        { key: 'roles', label: <><SafetyCertificateOutlined /> 角色管理</>, children: <RoleManagement /> },
-      ]} />
+        { key: 'roles', label: <><SafetyCertificateOutlined /> 角色管理</>, children: <RoleManagement isPlatform={isPlatformAdmin} /> },
+      ].filter(Boolean)} />
     </div>
   );
 }
@@ -42,14 +46,19 @@ function UserManagement() {
   const user = useAuthStore((s) => s.user);
   const [users, setUsers] = useState([]);
   const [roles, setRoles] = useState([]);
+  const [tenants, setTenants] = useState([]);
   const [loading, setLoading] = useState(false);
   const [modalVisible, setModalVisible] = useState(false);
+  const [editModalVisible, setEditModalVisible] = useState(false);
+  const [editingUser, setEditingUser] = useState(null);
   const [resetModalVisible, setResetModalVisible] = useState(false);
   const [resetUser, setResetUser] = useState(null);
   const [form] = Form.useForm();
+  const [editForm] = Form.useForm();
   const [resetForm] = Form.useForm();
+  const isPlatform = !user.tenant_id && user.permissions?.includes('system:platform');
 
-  useEffect(() => { fetchUsers(); fetchRoles(); }, []);
+  useEffect(() => { fetchUsers(); fetchRoles(); fetchTenants(); }, []);
 
   const fetchUsers = async () => {
     setLoading(true);
@@ -59,6 +68,16 @@ function UserManagement() {
 
   const fetchRoles = async () => {
     try { setRoles(await roleAPI.getRoles()); } catch {}
+  };
+
+  const fetchTenants = async () => {
+    if (!isPlatform) return;
+    try { setTenants(await tenantAPI.getList()); } catch {}
+  };
+
+  const handleTenantChange = async (tenantId) => {
+    if (!tenantId) { setRoles([]); form.setFieldsValue({ role_id: undefined }); editForm.setFieldsValue({ role_id: undefined }); return; }
+    try { setRoles(await tenantAPI.getRoles(tenantId)); } catch { message.error('加载角色失败'); }
   };
 
   const handleCreateUser = async () => {
@@ -71,6 +90,36 @@ function UserManagement() {
       fetchUsers();
     } catch (err) {
       if (err.message) message.error(err.message);
+    }
+  };
+
+  const handleEditUser = async () => {
+    try {
+      const values = await editForm.validateFields();
+      await fetch(`/api/auth/users/${editingUser.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${useAuthStore.getState().token}` },
+        body: JSON.stringify(values),
+      });
+      message.success('用户更新成功');
+      setEditModalVisible(false);
+      fetchUsers();
+    } catch (err) {
+      if (err.message) message.error(err.message);
+    }
+  };
+
+  const handleToggleStatus = async (userId, currentStatus) => {
+    try {
+      const action = currentStatus === 'active' ? 'disable' : 'enable';
+      await fetch(`/api/auth/users/${userId}/${action}`, {
+        method: 'PUT',
+        headers: { Authorization: `Bearer ${useAuthStore.getState().token}` },
+      });
+      message.success(currentStatus === 'active' ? '用户已停用' : '用户已启用');
+      fetchUsers();
+    } catch (err) {
+      message.error(err.message || '操作失败');
     }
   };
 
@@ -97,32 +146,58 @@ function UserManagement() {
     }
   };
 
+  const openEditUser = (record) => {
+    setEditingUser(record);
+    editForm.setFieldsValue({
+      name: record.name,
+      tenant_id: record.tenant_id,
+      role_id: record.role_id,
+      status: record.status,
+    });
+    if (record.tenant_id) handleTenantChange(record.tenant_id);
+    setEditModalVisible(true);
+  };
+
   const columns = [
     { title: 'ID', dataIndex: 'id', key: 'id', width: 60 },
     { title: '用户名', dataIndex: 'username', key: 'username' },
     { title: '姓名', dataIndex: 'name', key: 'name',
       render: (name) => <Space><UserOutlined />{name}</Space>,
     },
-    { title: '角色', dataIndex: 'role', key: 'role',
-      render: (role) => <Tag color={role === 'admin' ? '#1B4F72' : '#2E86C1'}>{role}</Tag>,
+    ...(isPlatform ? [
+      { title: '所属主体', dataIndex: 'tenant_name', key: 'tenant_name',
+        render: (name) => name ? <Tag color="purple">{name}</Tag> : '-',
+      },
+    ] : []),
+    { title: '角色', dataIndex: 'role_name', key: 'role_name',
+      render: (role) => <Tag color={role === 'admin' ? '#1B4F72' : '#2E86C1'}>{role || '-'}</Tag>,
+    },
+    { title: '状态', dataIndex: 'status', key: 'status', width: 80,
+      render: (status) => <Tag color={status === 'active' ? 'green' : 'red'}>{status === 'active' ? '正常' : '已停用'}</Tag>,
     },
     { title: '创建时间', dataIndex: 'created_at', key: 'created_at',
       render: (time) => time ? new Date(time).toLocaleString('zh-CN') : '-',
     },
-    { title: '操作', key: 'action', width: 120,
+    { title: '操作', key: 'action', width: 200,
       render: (_, record) => (
         <Space>
+          <Tooltip title="编辑">
+            <Button type="link" size="small" onClick={() => openEditUser(record)}>编辑</Button>
+          </Tooltip>
           <Tooltip title="重置密码">
             <Button type="link" size="small" icon={<LockOutlined />}
               onClick={() => { setResetUser(record); resetForm.resetFields(); setResetModalVisible(true); }} />
           </Tooltip>
+          <Tooltip title={record.status === 'active' ? '停用' : '启用'}>
+            <Button type="link" size="small"
+              icon={record.status === 'active' ? <StopOutlined /> : <CheckCircleOutlined />}
+              danger={record.status === 'active'}
+              onClick={() => handleToggleStatus(record.id, record.status)} />
+          </Tooltip>
           {record.id !== user.id && (
-            <Popconfirm title="确认删除该用户？" description="删除后该用户将无法登录"
-              onConfirm={() => handleDeleteUser(record.id, record.name)}
+            <Popconfirm title="确认删除该用户？" onConfirm={() => handleDeleteUser(record.id, record.name)}
               okText="确认删除" cancelText="取消" okButtonProps={{ danger: true }}>
-              <Tooltip title="删除">
-                <Button type="link" size="small" danger icon={<DeleteOutlined />} />
-              </Tooltip>
+              <Tooltip title="删除"><Button type="link" size="small" danger icon={<DeleteOutlined />} /></Tooltip>
             </Popconfirm>
           )}
         </Space>
@@ -134,7 +209,7 @@ function UserManagement() {
     <>
       <Card title={<Space><TeamOutlined /><span>用户管理</span></Space>}
         extra={<Button type="primary" icon={<PlusOutlined />}
-          onClick={() => { form.resetFields(); setModalVisible(true); }}>创建用户</Button>}>
+          onClick={() => { form.resetFields(); fetchRoles(); if (!isPlatform) form.setFieldsValue({ tenant_id: user.tenant_id }); setModalVisible(true); }}>创建用户</Button>}>
         <Table columns={columns} dataSource={users} rowKey="id" loading={loading} pagination={false} size="middle" />
       </Card>
 
@@ -142,17 +217,51 @@ function UserManagement() {
         onCancel={() => setModalVisible(false)} okText="创建" cancelText="取消" destroyOnHidden>
         <Form form={form} layout="vertical">
           <Form.Item name="username" label="用户名" rules={[{ required: true, message: '请输入用户名' }]}>
-            <Input placeholder="请输入用户名（登录用）" />
+            <Input placeholder="请输入用户名" />
           </Form.Item>
           <Form.Item name="password" label="密码" rules={[{ required: true, message: '请输入密码' }]}>
             <Input.Password placeholder="请输入密码" />
           </Form.Item>
           <Form.Item name="name" label="姓名" rules={[{ required: true, message: '请输入姓名' }]}>
-            <Input placeholder="请输入姓名（显示用）" />
+            <Input placeholder="请输入姓名" />
           </Form.Item>
-          <Form.Item name="role" label="角色" initialValue="sales" rules={[{ required: true }]}>
+          {isPlatform && (
+            <Form.Item name="tenant_id" label="所属主体" rules={[{ required: true, message: '请选择主体' }]}>
+              <Select placeholder="选择公司主体" onChange={handleTenantChange}>
+                {tenants.map(t => <Select.Option key={t.id} value={t.id}>{t.name}</Select.Option>)}
+              </Select>
+            </Form.Item>
+          )}
+          <Form.Item name="role_id" label="角色" rules={[{ required: true }]}>
+            <Select placeholder="选择角色">
+              {roles.map(r => <Select.Option key={r.id} value={r.id}>{r.name} - {r.description}</Select.Option>)}
+            </Select>
+          </Form.Item>
+        </Form>
+      </Modal>
+
+      <Modal title={`编辑用户 - ${editingUser?.name || ''}`} open={editModalVisible} onOk={handleEditUser}
+        onCancel={() => setEditModalVisible(false)} okText="保存" cancelText="取消" destroyOnHidden>
+        <Form form={editForm} layout="vertical">
+          <Form.Item name="name" label="姓名" rules={[{ required: true }]}>
+            <Input placeholder="请输入姓名" />
+          </Form.Item>
+          {isPlatform && (
+            <Form.Item name="tenant_id" label="所属主体">
+              <Select placeholder="选择公司主体" onChange={handleTenantChange} allowClear>
+                {tenants.map(t => <Select.Option key={t.id} value={t.id}>{t.name}</Select.Option>)}
+              </Select>
+            </Form.Item>
+          )}
+          <Form.Item name="role_id" label="角色">
+            <Select placeholder="选择角色" allowClear>
+              {roles.map(r => <Select.Option key={r.id} value={r.id}>{r.name}</Select.Option>)}
+            </Select>
+          </Form.Item>
+          <Form.Item name="status" label="状态">
             <Select>
-              {roles.map(r => <Select.Option key={r.id} value={r.name}>{r.name} - {r.description}</Select.Option>)}
+              <Select.Option value="active">正常</Select.Option>
+              <Select.Option value="inactive">停用</Select.Option>
             </Select>
           </Form.Item>
         </Form>
@@ -175,16 +284,22 @@ function UserManagement() {
 }
 
 // ===== 角色管理组件 =====
-function RoleManagement() {
+function RoleManagement({ isPlatform }) {
+  const user = useAuthStore((s) => s.user);
   const [roles, setRoles] = useState([]);
   const [allMenus, setAllMenus] = useState([]);
   const [allPermissions, setAllPermissions] = useState([]);
+  const [tenantsForRole, setTenantsForRole] = useState([]);
   const [loading, setLoading] = useState(false);
   const [modalVisible, setModalVisible] = useState(false);
   const [editingRole, setEditingRole] = useState(null);
   const [form] = Form.useForm();
 
-  useEffect(() => { fetchData(); }, []);
+  useEffect(() => { fetchData(); if (isPlatform) fetchTenants(); }, []);
+
+  const fetchTenants = async () => {
+    try { setTenantsForRole(await tenantAPI.getList()); } catch {}
+  };
 
   const fetchData = async () => {
     setLoading(true);
@@ -202,7 +317,7 @@ function RoleManagement() {
   const openCreate = () => {
     setEditingRole(null);
     form.resetFields();
-    form.setFieldsValue({ menus: [], permissions: [] });
+    form.setFieldsValue({ menus: [], permissions: [], ...(isPlatform ? {} : { tenant_id: user.tenant_id }) });
     setModalVisible(true);
   };
 
@@ -225,6 +340,7 @@ function RoleManagement() {
         description: values.description,
         menus: values.menus || [],
         permissions: values.permissions || [],
+        tenant_id: values.tenant_id,
       };
       if (editingRole) {
         await roleAPI.updateRole(editingRole.id, data);
@@ -261,6 +377,11 @@ function RoleManagement() {
       ),
     },
     { title: '描述', dataIndex: 'description', key: 'description' },
+    ...(isPlatform ? [
+      { title: '所属主体', dataIndex: 'tenant_name', key: 'tenant_name',
+        render: (name) => name ? <Tag color="purple">{name}</Tag> : '-',
+      },
+    ] : []),
     { title: '菜单权限', dataIndex: 'menus', key: 'menus',
       render: (menus) => (
         <Space wrap size={[0, 4]}>
@@ -314,6 +435,13 @@ function RoleManagement() {
         destroyOnHidden
       >
         <Form form={form} layout="vertical">
+          {isPlatform && !editingRole?.is_system && (
+            <Form.Item name="tenant_id" label="所属主体" rules={[{ required: true, message: '请选择主体' }]}>
+              <Select placeholder="选择公司主体">
+                {tenantsForRole.map(t => <Select.Option key={t.id} value={t.id}>{t.name}</Select.Option>)}
+              </Select>
+            </Form.Item>
+          )}
           <Form.Item name="name" label="角色名称" rules={[{ required: true, message: '请输入角色名称' }]}>
             <Input placeholder="如：销售主管、客服、财务" disabled={editingRole?.is_system} />
           </Form.Item>
@@ -338,6 +466,123 @@ function RoleManagement() {
               </Space>
             </Checkbox.Group>
           </Form.Item>
+        </Form>
+      </Modal>
+    </>
+  );
+}
+
+// ===== 主体管理组件 =====
+function TenantManagement() {
+  const [tenants, setTenants] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [modalVisible, setModalVisible] = useState(false);
+  const [editingTenant, setEditingTenant] = useState(null);
+  const [form] = Form.useForm();
+
+  useEffect(() => { fetchTenants(); }, []);
+
+  const fetchTenants = async () => {
+    setLoading(true);
+    try { setTenants(await tenantAPI.getList()); } catch {}
+    finally { setLoading(false); }
+  };
+
+  const handleSave = async () => {
+    try {
+      const values = await form.validateFields();
+      if (editingTenant) {
+        await tenantAPI.update(editingTenant.id, values);
+        message.success('主体更新成功');
+      } else {
+        await tenantAPI.create(values);
+        message.success('主体创建成功');
+      }
+      setModalVisible(false);
+      form.resetFields();
+      fetchTenants();
+    } catch (err) {
+      if (err.message) message.error(err.message);
+    }
+  };
+
+  const handleToggleStatus = async (id, currentStatus) => {
+    try {
+      if (currentStatus === 'active') {
+        await tenantAPI.disable(id);
+        message.success('主体已停用');
+      } else {
+        await tenantAPI.enable(id);
+        message.success('主体已启用');
+      }
+      fetchTenants();
+    } catch (err) {
+      message.error(err.message || '操作失败');
+    }
+  };
+
+  const columns = [
+    { title: 'ID', dataIndex: 'id', key: 'id', width: 60 },
+    { title: '主体名称', dataIndex: 'name', key: 'name',
+      render: (name) => <Space><BankOutlined />{name}</Space>,
+    },
+    { title: '状态', dataIndex: 'status', key: 'status', width: 80,
+      render: (status) => <Tag color={status === 'active' ? 'green' : 'red'}>{status === 'active' ? '正常' : '已停用'}</Tag>,
+    },
+    { title: '创建时间', dataIndex: 'created_at', key: 'created_at',
+      render: (time) => time ? new Date(time).toLocaleString('zh-CN') : '-',
+    },
+    { title: '操作', key: 'action', width: 160,
+      render: (_, record) => (
+        <Space>
+          <Button type="link" size="small" onClick={() => {
+            setEditingTenant(record);
+            form.setFieldsValue({ name: record.name, status: record.status });
+            setModalVisible(true);
+          }}>编辑</Button>
+          <Popconfirm
+            title={record.status === 'active' ? '确认停用该主体？停用后该公司所有用户将无法登录' : '确认启用该主体？'}
+            onConfirm={() => handleToggleStatus(record.id, record.status)}
+            okText="确认" cancelText="取消"
+            okButtonProps={{ danger: record.status === 'active' }}>
+            <Button type="link" size="small" danger={record.status === 'active'}>
+              {record.status === 'active' ? '停用' : '启用'}
+            </Button>
+          </Popconfirm>
+        </Space>
+      ),
+    },
+  ];
+
+  return (
+    <>
+      <Card title={<Space><BankOutlined /><span>主体管理</span></Space>}
+        extra={<Button type="primary" icon={<PlusOutlined />}
+          onClick={() => { setEditingTenant(null); form.resetFields(); setModalVisible(true); }}>创建主体</Button>}>
+        <Table columns={columns} dataSource={tenants} rowKey="id" loading={loading} pagination={false} size="middle" />
+      </Card>
+
+      <Modal
+        title={editingTenant ? `编辑主体 - ${editingTenant.name}` : '创建主体'}
+        open={modalVisible}
+        onOk={handleSave}
+        onCancel={() => setModalVisible(false)}
+        okText="保存"
+        cancelText="取消"
+        destroyOnHidden
+      >
+        <Form form={form} layout="vertical">
+          <Form.Item name="name" label="主体名称" rules={[{ required: true, message: '请输入主体名称' }]}>
+            <Input placeholder="如：深圳美鸥国际物流、XX货代公司" />
+          </Form.Item>
+          {editingTenant && (
+            <Form.Item name="status" label="状态">
+              <Select>
+                <Select.Option value="active">正常</Select.Option>
+                <Select.Option value="inactive">停用</Select.Option>
+              </Select>
+            </Form.Item>
+          )}
         </Form>
       </Modal>
     </>

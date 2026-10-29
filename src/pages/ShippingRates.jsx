@@ -29,7 +29,7 @@ function ShippingRates() {
   const [loading, setLoading] = useState(false);
   const [batches, setBatches] = useState([]);
   const [total, setTotal] = useState(0);
-  const [params, setParams] = useState({ page: 1, pageSize: 20, search: '', status: '' });
+  const [params, setParams] = useState({ page: 1, pageSize: 100, search: '', status: '', vessel: '', validFrom: '', validTo: '' });
   const [filters, setFilters] = useState({ pols: [], pods: [], container_types: [] });
   const [importing, setImporting] = useState(false);
   const [selectedRowKeys, setSelectedRowKeys] = useState([]);
@@ -39,10 +39,16 @@ function ShippingRates() {
   const user = useAuthStore((s) => s.user);
   const isAdmin = user?.role === 'admin' || user?.role === 'manager';
 
+  // 海运费模块数据权限：三个 Tab 各自可控
+  const perms = user?.permissions || [];
+  const canViewActive = perms.includes('shipping:active') || isAdmin;
+  const canViewBatches = perms.includes('shipping:batches') || isAdmin;
+  const canViewDetail = perms.includes('shipping:detail') || isAdmin;
+
   // 销售看板
   const [activeRates, setActiveRates] = useState([]);
   const [rateLoading, setRateLoading] = useState(false);
-  const [rateFilter, setRateFilter] = useState({ pol: '', pod: '', container_type: '' });
+  const [rateFilter, setRateFilter] = useState({ pol: '', pod: '', container_type: '', vessel: '', validFrom: '', validTo: '' });
 
   // 弹窗
   const [modalVisible, setModalVisible] = useState(false);
@@ -70,6 +76,16 @@ function ShippingRates() {
   const [subBatchRoute, setSubBatchRoute] = useState(null);
   const [subBatchItems, setSubBatchItems] = useState({});
   const [subBatchLoading, setSubBatchLoading] = useState(false);
+
+  // 报价明细数据
+  const [detailRows, setDetailRows] = useState([]);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailTotal, setDetailTotal] = useState(0);
+  const [detailParams, setDetailParams] = useState({ page: 1, pageSize: 20, pol: '', pod: '', carrier: '', supplier: '', validFrom: '', validTo: '' });
+  const [detailEditVisible, setDetailEditVisible] = useState(false);
+  const [detailEditRow, setDetailEditRow] = useState(null);
+  const [detailEditSaving, setDetailEditSaving] = useState(false);
+  const [detailForm] = Form.useForm();
 
   const fetchBatches = useCallback(async () => {
     setLoading(true);
@@ -295,6 +311,30 @@ function ShippingRates() {
       fetchBatches();
     } catch (err) {
       message.error('批量删除失败: ' + err.message);
+    }
+  };
+
+  const handleBatchExpire = async () => {
+    if (selectedRowKeys.length === 0) {
+      message.warning('请先选择要设为过期的批次');
+      return;
+    }
+    try {
+      const ids = [];
+      for (const key of selectedRowKeys) {
+        const parts = key.replace('route-', '').split('|');
+        if (parts.length >= 2) {
+          batches.forEach(b => {
+            if (b.pol === parts[0] && b.pod === parts.slice(1).join('|')) ids.push(b.id);
+          });
+        }
+      }
+      const res = await shippingRatesAPI.updateBatchStatusBatch(ids, 'expired');
+      message.success(`成功将 ${res.updated || ids.length} 个批次设为过期`);
+      setSelectedRowKeys([]);
+      fetchBatches();
+    } catch (err) {
+      message.error('批量设为过期失败: ' + err.message);
     }
   };
 
@@ -575,6 +615,55 @@ function ShippingRates() {
     }
   };
 
+  // ==================== 报价明细数据 ====================
+
+  const fetchDetails = useCallback(async () => {
+    setDetailLoading(true);
+    try {
+      const res = await shippingRatesAPI.getDetails(detailParams);
+      setDetailRows(res.list || []);
+      setDetailTotal(res.total || 0);
+    } catch (err) {
+      message.error('加载明细失败: ' + err.message);
+    } finally {
+      setDetailLoading(false);
+    }
+  }, [detailParams]);
+
+  useEffect(() => { if (activeTab === 'detail') fetchDetails(); }, [activeTab, fetchDetails]);
+
+  const openDetailEdit = (row) => {
+    detailForm.setFieldsValue({
+      carrier_name: row.carrier_name,
+      vessel_voyage: row.vessel_voyage,
+      freight_rate: row.freight_rate,
+      cost_freight: row.cost_freight,
+      transit_days: row.transit_days,
+      supplier_name: row.supplier_name,
+      supplier_contact: row.supplier_contact,
+      remarks: row.remarks,
+    });
+    setDetailEditRow(row);
+    setDetailEditVisible(true);
+  };
+
+  const handleDetailSave = async () => {
+    try {
+      const values = await detailForm.validateFields();
+      setDetailEditSaving(true);
+      await shippingRatesAPI.updateDetail(detailEditRow.id, values);
+      message.success('明细更新成功');
+      setDetailEditVisible(false);
+      setDetailEditRow(null);
+      fetchDetails();
+    } catch (err) {
+      if (err.errorFields) return;
+      message.error('更新失败: ' + err.message);
+    } finally {
+      setDetailEditSaving(false);
+    }
+  };
+
   // ==================== 渲染 ====================
 
   return (
@@ -589,8 +678,8 @@ function ShippingRates() {
           label: <span><DollarOutlined /> 当前报价（销售看板）</span>,
           children: (
             <Card>
-              <Row gutter={16} style={{ marginBottom: 16 }}>
-                <Col span={6}>
+              <Row gutter={16} style={{ marginBottom: 16 }} align="middle">
+                <Col span={4}>
                   <Select
                     placeholder="起运港" allowClear style={{ width: '100%' }}
                     value={rateFilter.pol || undefined}
@@ -598,7 +687,7 @@ function ShippingRates() {
                     options={filters.pols.map(p => ({ label: p, value: p }))}
                   />
                 </Col>
-                <Col span={6}>
+                <Col span={4}>
                   <Select
                     placeholder="目的港" allowClear style={{ width: '100%' }}
                     value={rateFilter.pod || undefined}
@@ -606,7 +695,7 @@ function ShippingRates() {
                     options={filters.pods.map(p => ({ label: p, value: p }))}
                   />
                 </Col>
-                <Col span={6}>
+                <Col span={4}>
                   <Select
                     placeholder="箱型" allowClear style={{ width: '100%' }}
                     value={rateFilter.container_type || undefined}
@@ -614,7 +703,25 @@ function ShippingRates() {
                     options={filters.container_types.map(t => ({ label: t, value: t }))}
                   />
                 </Col>
-                <Col span={6}>
+                <Col span={4}>
+                  <Input
+                    placeholder="船名航次" allowClear
+                    value={rateFilter.vessel}
+                    onChange={e => setRateFilter(prev => ({ ...prev, vessel: e.target.value }))}
+                  />
+                </Col>
+                <Col span={5}>
+                  <RangePicker
+                    placeholder={['有效期起', '有效期止']} style={{ width: '100%' }}
+                    value={rateFilter.validFrom && rateFilter.validTo ? [dayjs(rateFilter.validFrom), dayjs(rateFilter.validTo)] : null}
+                    onChange={(dates) => setRateFilter(prev => ({
+                      ...prev,
+                      validFrom: dates ? dates[0].format('YYYY-MM-DD') : '',
+                      validTo: dates ? dates[1].format('YYYY-MM-DD') : '',
+                    }))}
+                  />
+                </Col>
+                <Col span={3}>
                   <Button icon={<ReloadOutlined />} onClick={fetchActiveRates}>刷新</Button>
                 </Col>
               </Row>
@@ -701,7 +808,7 @@ function ShippingRates() {
             </Card>
           ),
         },
-        ...(isAdmin ? [{
+        ...(canViewBatches ? [{
           key: 'batches',
           label: <span><HistoryOutlined /> 报价批次管理</span>,
           children: (
@@ -721,6 +828,21 @@ function ShippingRates() {
                       onChange={v => setParams(prev => ({ ...prev, status: v || '', page: 1 }))}
                       options={[{ label: '有效', value: 'active' }, { label: '过期', value: 'expired' }]}
                     />
+                    <Input
+                      placeholder="船名航次" allowClear style={{ width: 150 }}
+                      value={params.vessel}
+                      onChange={e => setParams(prev => ({ ...prev, vessel: e.target.value, page: 1 }))}
+                    />
+                    <RangePicker
+                      placeholder={['有效期起', '有效期止']} style={{ width: 240 }}
+                      value={params.validFrom && params.validTo ? [dayjs(params.validFrom), dayjs(params.validTo)] : null}
+                      onChange={(dates) => setParams(prev => ({
+                        ...prev,
+                        validFrom: dates ? dates[0].format('YYYY-MM-DD') : '',
+                        validTo: dates ? dates[1].format('YYYY-MM-DD') : '',
+                        page: 1,
+                      }))}
+                    />
                     <Button type="primary" icon={<PlusOutlined />} onClick={handleCreate}>新增批次</Button>
                     <Button icon={<SettingOutlined />} onClick={handleSupplierManage}>订舱口管理</Button>
                   </Space>
@@ -734,6 +856,15 @@ function ShippingRates() {
                     >
                       <Button danger icon={<DeleteOutlined />} disabled={selectedRowKeys.length === 0}>
                         批量删除{selectedRowKeys.length > 0 ? `(${selectedRowKeys.length})` : ''}
+                      </Button>
+                    </Popconfirm>
+                    <Popconfirm
+                      title={selectedRowKeys.length > 0 ? `确认将选中的 ${selectedRowKeys.length} 个批次设为过期？` : ''}
+                      onConfirm={handleBatchExpire}
+                      disabled={selectedRowKeys.length === 0}
+                    >
+                      <Button icon={<MinusCircleOutlined />} disabled={selectedRowKeys.length === 0}>
+                        批量设为过期{selectedRowKeys.length > 0 ? `(${selectedRowKeys.length})` : ''}
                       </Button>
                     </Popconfirm>
                     <Upload accept=".xlsx,.xls" showUploadList={false} beforeUpload={handleImport}>
@@ -775,6 +906,22 @@ function ShippingRates() {
                       dataSource={routes}
                       columns={routeColumns}
                       rowKey={(r) => `route-${r.pol}|${r.pod}`}
+                      summary={(pageData) => {
+                        const totalBatches = pageData.reduce((sum, r) => sum + (r.children || []).length, 0);
+                        return (
+                          <Table.Summary fixed>
+                            <Table.Summary.Row>
+                              <Table.Summary.Cell index={0}><Text strong>合计：{pageData.length} 条航线</Text></Table.Summary.Cell>
+                              <Table.Summary.Cell index={1} />
+                              <Table.Summary.Cell index={2} />
+                              <Table.Summary.Cell index={3} align="center"><Text strong>{totalBatches} 个批次</Text></Table.Summary.Cell>
+                              <Table.Summary.Cell index={4} />
+                              <Table.Summary.Cell index={5} />
+                              <Table.Summary.Cell index={6} />
+                            </Table.Summary.Row>
+                          </Table.Summary>
+                        );
+                      }}
                       loading={loading}
                       size="small"
                       pagination={false}
@@ -868,7 +1015,158 @@ function ShippingRates() {
           ),
         },
       ] : []),
+      ...(canViewDetail ? [{
+        key: 'detail',
+        label: <span><FileExcelOutlined /> 报价明细数据</span>,
+        children: (
+          <Card>
+            <Row gutter={12} style={{ marginBottom: 16 }}>
+              <Col span={4}>
+                <Input placeholder="起运港" allowClear value={detailParams.pol}
+                  onChange={e => setDetailParams(prev => ({ ...prev, pol: e.target.value, page: 1 }))} />
+              </Col>
+              <Col span={4}>
+                <Input placeholder="目的港" allowClear value={detailParams.pod}
+                  onChange={e => setDetailParams(prev => ({ ...prev, pod: e.target.value, page: 1 }))} />
+              </Col>
+              <Col span={4}>
+                <Input placeholder="船公司" allowClear value={detailParams.carrier}
+                  onChange={e => setDetailParams(prev => ({ ...prev, carrier: e.target.value, page: 1 }))} />
+              </Col>
+              <Col span={4}>
+                <Input placeholder="订舱口" allowClear value={detailParams.supplier}
+                  onChange={e => setDetailParams(prev => ({ ...prev, supplier: e.target.value, page: 1 }))} />
+              </Col>
+              <Col span={6}>
+                <Space>
+                  <DatePicker placeholder="有效期起" value={detailParams.validFrom ? dayjs(detailParams.validFrom) : null}
+                    onChange={v => setDetailParams(prev => ({ ...prev, validFrom: v ? v.format('YYYY-MM-DD') : '', page: 1 }))} style={{ width: 130 }} />
+                  <span>-</span>
+                  <DatePicker placeholder="有效期止" value={detailParams.validTo ? dayjs(detailParams.validTo) : null}
+                    onChange={v => setDetailParams(prev => ({ ...prev, validTo: v ? v.format('YYYY-MM-DD') : '', page: 1 }))} style={{ width: 130 }} />
+                </Space>
+              </Col>
+              <Col span={2}>
+                <Button type="primary" icon={<SearchOutlined />} onClick={fetchDetails}>
+                  搜索
+                </Button>
+              </Col>
+            </Row>
+
+            <Table
+              dataSource={detailRows}
+              rowKey="id"
+              loading={detailLoading}
+              size="small"
+              scroll={{ x: 1100 }}
+              columns={[
+                { title: '起运港', dataIndex: 'pol', width: 90, render: v => <Tag color="blue">{v}</Tag> },
+                { title: '目的港', dataIndex: 'pod', width: 90, render: v => <Tag color="green">{v}</Tag> },
+                { title: '箱型', dataIndex: 'container_type', width: 70, render: v => <Tag>{v}</Tag> },
+                { title: '有效期', key: 'valid', width: 180, render: (_, r) => `${r.valid_from || '-'} ~ ${r.valid_to || '-'}` },
+                { title: '船公司', dataIndex: 'carrier_name', width: 90, render: v => <Tag color="blue">{v}</Tag> },
+                { title: '船名航次', dataIndex: 'vessel_voyage', width: 160 },
+                { title: '海运费(USD)', dataIndex: 'freight_rate', width: 110, align: 'right', render: v => v ? <Text strong style={{ color: '#cf1322' }}>$ {v.toLocaleString()}</Text> : '-' },
+                { title: '成本(USD)', dataIndex: 'cost_freight', width: 100, align: 'right', render: v => v ? <Text type="secondary">$ {v.toLocaleString()}</Text> : '-' },
+                { title: '航程(天)', dataIndex: 'transit_days', width: 80, render: v => v ? <Tag color="purple">{v}</Tag> : '-' },
+                { title: '订舱口', dataIndex: 'supplier_name', width: 90 },
+                {
+                  title: '操作', key: 'actions', width: 80, fixed: 'right',
+                  render: (_, r) => (
+                    <Button type="link" size="small" icon={<EditOutlined />}
+                      onClick={() => openDetailEdit(r)} />
+                  ),
+                },
+              ]}
+              pagination={false}
+            />
+
+            <div style={{ marginTop: 16, textAlign: 'right' }}>
+              <Space>
+                <Text type="secondary">共 {detailTotal} 条</Text>
+                <Select
+                  value={detailParams.pageSize}
+                  onChange={v => setDetailParams(prev => ({ ...prev, pageSize: v, page: 1 }))}
+                  options={[10, 20, 50, 100].map(v => ({ label: `${v}条/页`, value: v }))}
+                  style={{ width: 100 }}
+                />
+                <Pagination
+                  current={detailParams.page}
+                  total={detailTotal}
+                  pageSize={detailParams.pageSize}
+                  showQuickJumper
+                  showSizeChanger={false}
+                  onChange={page => setDetailParams(prev => ({ ...prev, page }))}
+                />
+              </Space>
+            </div>
+          </Card>
+        ),
+      }] : []),
       ]} />
+
+      {/* ==================== 报价明细编辑弹窗 ==================== */}
+      <Modal
+        title="编辑报价明细"
+        open={detailEditVisible}
+        width={600}
+        onOk={handleDetailSave}
+        onCancel={() => { setDetailEditVisible(false); setDetailEditRow(null); }}
+        confirmLoading={detailEditSaving}
+      >
+        <Form form={detailForm} layout="vertical">
+          <Row gutter={16}>
+            <Col span={12}>
+              <Form.Item name="carrier_name" label="船公司">
+                <Select placeholder="选择船公司" allowClear showSearch
+                  options={CARRIER_OPTIONS}
+                  filterOption={(input, option) => option.label.toLowerCase().includes(input.toLowerCase())} />
+              </Form.Item>
+            </Col>
+            <Col span={12}>
+              <Form.Item name="vessel_voyage" label="船名航次">
+                <Input placeholder="如：COSCO SOUTH CHINA SEA/085E" />
+              </Form.Item>
+            </Col>
+          </Row>
+          <Row gutter={16}>
+            <Col span={12}>
+              <Form.Item name="freight_rate" label="海运费(USD)">
+                <InputNumber style={{ width: '100%' }} min={0} precision={0} placeholder="如：8215" />
+              </Form.Item>
+            </Col>
+            <Col span={12}>
+              <Form.Item name="cost_freight" label="成本(USD)">
+                <InputNumber style={{ width: '100%' }} min={0} precision={0} placeholder="如：7000" />
+              </Form.Item>
+            </Col>
+          </Row>
+          <Row gutter={16}>
+            <Col span={12}>
+              <Form.Item name="transit_days" label="航程(天)">
+                <Input placeholder="如：14+" />
+              </Form.Item>
+            </Col>
+            <Col span={12}>
+              <Form.Item name="supplier_name" label="订舱口">
+                <Input placeholder="如：聚航" />
+              </Form.Item>
+            </Col>
+          </Row>
+          <Row gutter={16}>
+            <Col span={12}>
+              <Form.Item name="supplier_contact" label="联系人">
+                <Input placeholder="订舱口联系人" />
+              </Form.Item>
+            </Col>
+            <Col span={12}>
+              <Form.Item name="remarks" label="备注">
+                <Input placeholder="备注信息" />
+              </Form.Item>
+            </Col>
+          </Row>
+        </Form>
+      </Modal>
 
       {/* ==================== 新增/编辑弹窗 ==================== */}
       <Modal

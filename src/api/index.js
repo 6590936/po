@@ -198,6 +198,16 @@ export const roleAPI = {
   deleteRole: (id) => request(`/roles/${id}`, { method: 'DELETE' }),
 };
 
+export const tenantAPI = {
+  getList: () => request('/tenants'),
+  getDetail: (id) => request(`/tenants/${id}`),
+  create: (data) => request('/tenants', { method: 'POST', body: JSON.stringify(data) }),
+  update: (id, data) => request(`/tenants/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  disable: (id) => request(`/tenants/${id}/disable`, { method: 'PUT' }),
+  enable: (id) => request(`/tenants/${id}/enable`, { method: 'PUT' }),
+  getRoles: (id) => request(`/tenants/${id}/roles`),
+};
+
 // 客户端门户
 export const clientAPI = {
   login: (data) => request('/client/login', { method: 'POST', body: JSON.stringify(data) }),
@@ -305,6 +315,7 @@ export const shippingRatesAPI = {
   deleteBatch: (id) => request(`/shipping-rates/batches/${id}`, { method: 'DELETE' }),
   deleteBatches: (ids) => request('/shipping-rates/batches/batch-delete', { method: 'POST', body: JSON.stringify({ ids }) }),
   updateBatchStatus: (id, status) => request(`/shipping-rates/batches/${id}/status`, { method: 'PUT', body: JSON.stringify({ status }) }),
+  updateBatchStatusBatch: (ids, status) => request('/shipping-rates/batches/batch-status', { method: 'POST', body: JSON.stringify({ ids, status }) }),
   getActiveRates: (params = {}) => { const query = new URLSearchParams(params).toString(); return request(`/shipping-rates/active?${query}`); },
   getFilters: () => request('/shipping-rates/filters'),
   importExcel: (file) => {
@@ -320,4 +331,6 @@ export const shippingRatesAPI = {
   getSuppliers: () => request('/shipping-rates/suppliers'),
   createSupplier: (data) => request('/shipping-rates/suppliers', { method: 'POST', body: JSON.stringify(data) }),
   deleteSupplier: (id) => request(`/shipping-rates/suppliers/${id}`, { method: 'DELETE' }),
+  getDetails: async (params = {}) => { const query = new URLSearchParams(params).toString(); const token = useAuthStore.getState().token; const resp = await fetch(`/api/shipping-rates/details?${query}`, { headers: { Authorization: `Bearer ${token}` } }); const json = await resp.json(); if (!resp.ok) throw new Error(json.error); return json.data; },
+  updateDetail: (id, data) => request(`/shipping-rates/details/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
 };

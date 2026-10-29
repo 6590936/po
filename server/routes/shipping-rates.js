@@ -66,6 +66,9 @@ router.get('/batches', (req, res) => {
     const status = req.query.status || '';
     const pol = req.query.pol || '';
     const pod = req.query.pod || '';
+    const vessel = req.query.vessel || '';
+    const validFrom = req.query.validFrom || '';
+    const validTo = req.query.validTo || '';
 
     let where = "WHERE b.pol IS NOT NULL AND b.pol != '' AND b.pod IS NOT NULL AND b.pod != '' AND b.valid_from IS NOT NULL AND b.valid_to IS NOT NULL";
     const params = [];
@@ -73,6 +76,9 @@ router.get('/batches', (req, res) => {
     if (status) { where += ' AND b.status = ?'; params.push(status); }
     if (pol) { where += ' AND b.pol = ?'; params.push(pol); }
     if (pod) { where += ' AND b.pod = ?'; params.push(pod); }
+    if (vessel) { where += ' AND b.id IN (SELECT batch_id FROM shipping_rate_items WHERE vessel_voyage LIKE ?)'; params.push('%' + vessel + '%'); }
+    if (validFrom) { where += ' AND b.valid_to >= ?'; params.push(validFrom); }
+    if (validTo) { where += ' AND b.valid_from <= ?'; params.push(validTo); }
 
     const countRow = db.prepare('SELECT COUNT(*) as cnt FROM shipping_rate_batches b ' + where).get(...params);
     const batches = db.prepare(
@@ -232,6 +238,29 @@ router.put('/batches/:id/status', (req, res) => {
   }
 });
 
+router.post('/batches/batch-status', (req, res) => {
+  try {
+    const db = getDb();
+    const { ids, status } = req.body;
+    if (!ids || !Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ success: false, error: '请选择要操作的批次' });
+    }
+    if (!['active', 'expired'].includes(status)) {
+      return res.status(400).json({ success: false, error: '状态值无效' });
+    }
+    if (ids.length > 200) {
+      return res.status(400).json({ success: false, error: '单次最多操作200条' });
+    }
+    const placeholders = ids.map(() => '?').join(',');
+    const now = new Date().toISOString();
+    const result = db.prepare('UPDATE shipping_rate_batches SET status=?, updated_at=? WHERE id IN (' + placeholders + ')')
+      .run(status, now, ...ids);
+    res.json({ success: true, data: { updated: result.changes } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // ==================== 销售看板 - 当前有效报价 ====================
 
 router.get('/active', (req, res) => {
@@ -240,12 +269,18 @@ router.get('/active', (req, res) => {
     const pol = req.query.pol || '';
     const pod = req.query.pod || '';
     const container_type = req.query.container_type || '';
+    const vessel = req.query.vessel || '';
+    const validFrom = req.query.validFrom || '';
+    const validTo = req.query.validTo || '';
 
     let where = "WHERE b.status = 'active' AND b.valid_from <= date('now','localtime') AND b.valid_to >= date('now','localtime')";
     const params = [];
     if (pol) { where += ' AND b.pol = ?'; params.push(pol); }
     if (pod) { where += ' AND b.pod = ?'; params.push(pod); }
     if (container_type) { where += ' AND b.container_type = ?'; params.push(container_type); }
+    if (vessel) { where += ' AND b.id IN (SELECT batch_id FROM shipping_rate_items WHERE vessel_voyage LIKE ?)'; params.push('%' + vessel + '%'); }
+    if (validFrom) { where += ' AND b.valid_to >= ?'; params.push(validFrom); }
+    if (validTo) { where += ' AND b.valid_from <= ?'; params.push(validTo); }
 
     const batches = db.prepare(
       'SELECT b.*, u.name as created_by_name ' +
@@ -679,6 +714,71 @@ router.get('/batches/:id/quotation-preview', (req, res) => {
     };
 
     res.json({ success: true, data: data });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ==================== 报价明细数据 ====================
+
+router.get('/details', (req, res) => {
+  try {
+    const db = getDb();
+    const page = parseInt(req.query.page) || 1;
+    const size = parseInt(req.query.pageSize) || 20;
+    const offset = (page - 1) * size;
+
+    const pol = req.query.pol || '';
+    const pod = req.query.pod || '';
+    const carrier = req.query.carrier || '';
+    const supplier = req.query.supplier || '';
+    const validFrom = req.query.validFrom || '';
+    const validTo = req.query.validTo || '';
+
+    let where = "WHERE 1=1";
+    const params = [];
+    if (pol) { where += ' AND b.pol LIKE ?'; params.push('%' + pol + '%'); }
+    if (pod) { where += ' AND b.pod LIKE ?'; params.push('%' + pod + '%'); }
+    if (carrier) { where += ' AND i.carrier_name LIKE ?'; params.push('%' + carrier + '%'); }
+    if (supplier) { where += ' AND i.supplier_name LIKE ?'; params.push('%' + supplier + '%'); }
+    if (validFrom) { where += ' AND b.valid_to >= ?'; params.push(validFrom); }
+    if (validTo) { where += ' AND b.valid_from <= ?'; params.push(validTo); }
+
+    const countRow = db.prepare(
+      'SELECT COUNT(*) as cnt FROM shipping_rate_items i JOIN shipping_rate_batches b ON i.batch_id = b.id ' + where
+    ).get(...params);
+
+    const rows = db.prepare(
+      'SELECT i.id, i.batch_id, b.pol, b.pod, b.container_type, b.valid_from, b.valid_to, b.status as batch_status, ' +
+      'i.carrier_name, i.vessel_voyage, i.freight_rate, i.cost_freight, i.transit_days, i.supplier_name, i.supplier_contact, i.remarks, i.sort_order ' +
+      'FROM shipping_rate_items i JOIN shipping_rate_batches b ON i.batch_id = b.id ' +
+      where +
+      ' ORDER BY b.valid_from DESC, b.pol, b.pod, i.sort_order LIMIT ? OFFSET ?'
+    ).all(...params, size, offset);
+
+    res.json({ success: true, data: { list: rows, total: countRow.cnt, page, size } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+router.put('/details/:id', (req, res) => {
+  try {
+    const db = getDb();
+    const id = parseInt(req.params.id);
+    const item = db.prepare('SELECT * FROM shipping_rate_items WHERE id = ?').get(id);
+    if (!item) return res.status(404).json({ success: false, error: '明细不存在' });
+
+    const { carrier_name, vessel_voyage, freight_rate, cost_freight, transit_days, supplier_name, supplier_contact, remarks } = req.body;
+
+    db.prepare(
+      'UPDATE shipping_rate_items SET carrier_name = COALESCE(?, carrier_name), vessel_voyage = COALESCE(?, vessel_voyage), freight_rate = COALESCE(?, freight_rate), cost_freight = COALESCE(?, cost_freight), transit_days = COALESCE(?, transit_days), supplier_name = COALESCE(?, supplier_name), supplier_contact = COALESCE(?, supplier_contact), remarks = COALESCE(?, remarks) WHERE id = ?'
+    ).run(
+      carrier_name ?? null, vessel_voyage ?? null, freight_rate ?? null, cost_freight ?? null,
+      transit_days ?? null, supplier_name ?? null, supplier_contact ?? null, remarks ?? null, id
+    );
+
+    res.json({ success: true, data: { id } });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }

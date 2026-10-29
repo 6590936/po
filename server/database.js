@@ -292,11 +292,19 @@ function createTables() {
   try { db.exec('CREATE INDEX IF NOT EXISTS idx_yy_customers_wechat_id ON yunwuyun_customers(wechat_id)'); } catch (_) {}
 
   db.exec(`
-    CREATE TABLE IF NOT EXISTS roles (
+    CREATE TABLE IF NOT EXISTS tenants (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT UNIQUE NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active',
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS roles (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
       description TEXT DEFAULT '',
       is_system INTEGER DEFAULT 0,
+      tenant_id INTEGER REFERENCES tenants(id),
       created_at TEXT NOT NULL
     );
 
@@ -565,6 +573,44 @@ function createTables() {
   try { db.exec("ALTER TABLE shipping_rate_items ADD COLUMN cost_freight REAL DEFAULT 0"); } catch {}
   try { db.exec("ALTER TABLE users ADD COLUMN wechat_openid TEXT"); } catch {}
 
+  try { db.exec("ALTER TABLE users ADD COLUMN tenant_id INTEGER REFERENCES tenants(id)"); } catch {}
+  try { db.exec("ALTER TABLE users ADD COLUMN role_id INTEGER REFERENCES roles(id)"); } catch {}
+  try { db.exec("ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'active'"); } catch {}
+  try { db.exec("ALTER TABLE customers ADD COLUMN tenant_id INTEGER REFERENCES tenants(id)"); } catch {}
+  try { db.exec("ALTER TABLE roles ADD COLUMN tenant_id INTEGER REFERENCES tenants(id)"); } catch {}
+  try { db.exec("ALTER TABLE tenants ADD COLUMN parent_id INTEGER REFERENCES tenants(id)"); } catch {}
+
+  // 修复：移除 roles.name 全局 UNIQUE，替换为 (name, tenant_id) 复合唯一索引
+  try {
+    const idxExists = db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_roles_name_tenant'").get();
+    if (!idxExists) {
+      const schema = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='roles'").get();
+      if (schema && schema.sql.includes('name TEXT UNIQUE NOT NULL')) {
+        db.exec('PRAGMA foreign_keys = OFF');
+        db.exec(`
+          CREATE TABLE roles_v2 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            is_system INTEGER DEFAULT 0,
+            tenant_id INTEGER REFERENCES tenants(id),
+            created_at TEXT NOT NULL
+          );
+          INSERT INTO roles_v2 SELECT id, name, description, is_system, tenant_id, created_at FROM roles;
+          DROP TABLE roles;
+          ALTER TABLE roles_v2 RENAME TO roles;
+        `);
+        db.exec('CREATE UNIQUE INDEX idx_roles_name_tenant ON roles(name, tenant_id)');
+        db.exec('PRAGMA foreign_keys = ON');
+        console.log('✅ roles 表重建：全局 UNIQUE(name) → 租户内唯一(name, tenant_id)');
+      }
+    }
+  } catch (e) {
+    console.error('roles 表重建失败:', e.message);
+  }
+
+  try { db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_roles_name_tenant ON roles(name, tenant_id)'); } catch {}
+
   // === 费用明细模板 ===
   db.exec(`
     CREATE TABLE IF NOT EXISTS fee_templates (
@@ -700,14 +746,50 @@ function migrateFromJSON() {
   }
 }
 
-function initDefaultData() {
+function runTenantMigration() {
+  try { db.exec("ALTER TABLE roles ADD COLUMN tenant_id INTEGER REFERENCES tenants(id)"); } catch {}
   const now = new Date().toISOString();
 
-  // 初始化默认角色
+  let platformTenant = db.prepare("SELECT id FROM tenants WHERE name = ?").get('美鸥主公司');
+  if (!platformTenant) {
+    const createResult = db.prepare("INSERT INTO tenants (name, status, created_at) VALUES (?, 'active', ?)")
+      .run('美鸥主公司', now);
+    platformTenant = { id: createResult.lastInsertRowid };
+    console.log('✅ 创建默认租户：美鸥主公司');
+  }
+
+  const tenantId = platformTenant.id;
+
+  db.prepare('UPDATE users SET tenant_id = ? WHERE tenant_id IS NULL').run(tenantId);
+  // 系统内置 admin 不受租户隔离，tenant_id 保持 NULL
+  db.prepare("UPDATE users SET tenant_id = NULL WHERE username = 'admin'").run();
+  db.prepare("UPDATE users SET role_id = (SELECT id FROM roles WHERE name = users.role AND roles.tenant_id = ? LIMIT 1) WHERE role_id IS NULL").run(tenantId);
+  db.prepare("UPDATE users SET status = 'active' WHERE status IS NULL").run();
+
+  db.prepare('UPDATE roles SET tenant_id = ? WHERE tenant_id IS NULL').run(tenantId);
+
+  db.prepare('UPDATE customers SET tenant_id = ? WHERE tenant_id IS NULL').run(tenantId);
+
+  try {
+    const adminRole = db.prepare("SELECT id FROM roles WHERE name = 'admin' AND tenant_id = ?").get(tenantId);
+    if (adminRole) {
+      db.prepare('INSERT OR IGNORE INTO role_permissions (role_id, permission_key) VALUES (?, ?)')
+        .run(adminRole.id, 'system:platform');
+    }
+  } catch (_) {}
+
+  console.log('✅ 多租户存量数据回填完成');
+}
+
+function initDefaultData() {
+  const now = new Date().toISOString();
+  const platformTenant = db.prepare("SELECT id FROM tenants WHERE name = '美鸥主公司'").get();
+  const tenantId = platformTenant ? platformTenant.id : null;
+
   const roleCount = db.prepare('SELECT COUNT(*) as cnt FROM roles').get();
   if (roleCount.cnt === 0) {
     const insertRole = db.prepare(
-      'INSERT INTO roles (name, description, is_system, created_at) VALUES (?, ?, 1, ?)'
+      'INSERT INTO roles (name, description, is_system, tenant_id, created_at) VALUES (?, ?, 1, ?, ?)'
     );
     const insertMenu = db.prepare(
       'INSERT OR IGNORE INTO role_menus (role_id, menu_key) VALUES (?, ?)'
@@ -716,27 +798,30 @@ function initDefaultData() {
       'INSERT OR IGNORE INTO role_permissions (role_id, permission_key) VALUES (?, ?)'
     );
 
-    // 管理员角色 - 所有菜单 + 所有数据权限
-    const adminRole = insertRole.run('admin', '系统管理员，拥有所有权限', now);
+    const adminRole = insertRole.run('admin', '系统管理员，拥有所有权限', tenantId, now);
     const adminMenus = ['/', '/customers', '/reminders', '/daily-report', '/quotes', '/weekly-report', '/yunwuyun', '/tracking', '/sales', '/admin'];
     for (const m of adminMenus) insertMenu.run(adminRole.lastInsertRowid, m);
     insertPerm.run(adminRole.lastInsertRowid, 'data:all');
+    insertPerm.run(adminRole.lastInsertRowid, 'system:platform');
+    insertPerm.run(adminRole.lastInsertRowid, 'shipping:active');
+    insertPerm.run(adminRole.lastInsertRowid, 'shipping:batches');
+    insertPerm.run(adminRole.lastInsertRowid, 'shipping:detail');
 
-    // 销售角色 - 部分菜单 + 只看自己数据
-    const salesRole = insertRole.run('sales', '销售人员，管理自己的客户和业务', now);
+    const salesRole = insertRole.run('sales', '销售人员，管理自己的客户和业务', tenantId, now);
     const salesMenus = ['/', '/customers', '/reminders', '/daily-report', '/quotes', '/weekly-report', '/tracking', '/sales'];
     for (const m of salesMenus) insertMenu.run(salesRole.lastInsertRowid, m);
     insertPerm.run(salesRole.lastInsertRowid, 'data:own');
   }
 
-  // 初始化默认用户
   const userCount = db.prepare('SELECT COUNT(*) as cnt FROM users').get();
   if (userCount.cnt === 0) {
+    const adminRoleId = db.prepare("SELECT id FROM roles WHERE name = 'admin' AND tenant_id = ?").get(tenantId);
+    const salesRoleId = db.prepare("SELECT id FROM roles WHERE name = 'sales' AND tenant_id = ?").get(tenantId);
     const insertUser = db.prepare(
-      'INSERT OR IGNORE INTO users (username, password, name, role, created_at) VALUES (?, ?, ?, ?, ?)'
+      'INSERT OR IGNORE INTO users (username, password, name, role, role_id, tenant_id, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
     );
-    insertUser.run('admin', bcrypt.hashSync('admin123', 10), '系统管理员', 'admin', now);
-    insertUser.run('sales1', bcrypt.hashSync('123456', 10), '张销售', 'sales', now);
+    insertUser.run('admin', bcrypt.hashSync('admin123', 10), '系统管理员', 'admin', adminRoleId.id, null, 'active', now);
+    insertUser.run('sales1', bcrypt.hashSync('123456', 10), '张销售', 'sales', salesRoleId.id, tenantId, 'active', now);
   }
 
   // 迁移：给已有角色补充轨迹查验菜单权限（兼容老数据库）
@@ -750,6 +835,20 @@ function initDefaultData() {
       }
     }
   } catch (_) {}
+
+  // 迁移：给已有管理员角色补充海运费模块数据权限（兼容老数据库）
+  try {
+    const shippingPerms = ['shipping:active', 'shipping:batches', 'shipping:detail'];
+    const insertPerm = db.prepare('INSERT OR IGNORE INTO role_permissions (role_id, permission_key) VALUES (?, ?)');
+    const rolesWithAll = db.prepare(
+      "SELECT DISTINCT r.id FROM roles r INNER JOIN role_permissions rp ON r.id = rp.role_id WHERE rp.permission_key IN ('data:all', 'system:platform')"
+    ).all();
+    for (const r of rolesWithAll) {
+      for (const p of shippingPerms) {
+        insertPerm.run(r.id, p);
+      }
+    }
+  } catch (_) {}
 }
 
 export function initDatabase() {
@@ -758,6 +857,7 @@ export function initDatabase() {
   db.pragma('foreign_keys = ON');
   createTables();
   migrateFromJSON();
+  runTenantMigration();
   initDefaultData();
   console.log('📦 SQLite数据库初始化完成');
 }
@@ -765,24 +865,60 @@ export function initDatabase() {
 // ===== 用户操作 =====
 export const UserOps = {
   findByCredentials(username, password) {
-    const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
+    const user = db.prepare(`
+      SELECT u.*, t.name as tenant_name, t.status as tenant_status, r.id as role_id
+      FROM users u
+      LEFT JOIN tenants t ON u.tenant_id = t.id
+      LEFT JOIN roles r ON u.role_id = r.id
+      WHERE u.username = ?
+    `).get(username);
     if (!user) return null;
     if (!bcrypt.compareSync(password, user.password)) return null;
     return user;
   },
   findById(id) {
-    return db.prepare('SELECT * FROM users WHERE id = ?').get(id) || null;
+    return db.prepare(`
+      SELECT u.*, t.name as tenant_name, t.status as tenant_status,
+             r.name as role_name, r.id as role_id
+      FROM users u
+      LEFT JOIN tenants t ON u.tenant_id = t.id
+      LEFT JOIN roles r ON u.role_id = r.id
+      WHERE u.id = ?
+    `).get(id) || null;
   },
-  findAll() {
-    return db.prepare('SELECT id, username, name, role, created_at FROM users ORDER BY id').all();
+  findAll(tenantIds) {
+    if (tenantIds && tenantIds.length) {
+      const placeholders = tenantIds.map(() => '?').join(',');
+      return db.prepare(`
+        SELECT u.id, u.username, u.name, u.role, u.created_at,
+               t.name as tenant_name, u.tenant_id,
+               r.name as role_name, u.role_id,
+               u.status
+        FROM users u
+        LEFT JOIN tenants t ON u.tenant_id = t.id
+        LEFT JOIN roles r ON u.role_id = r.id
+        WHERE u.tenant_id IN (${placeholders})
+        ORDER BY u.id
+      `).all(...tenantIds);
+    }
+    return db.prepare(`
+      SELECT u.id, u.username, u.name, u.role, u.created_at,
+             t.name as tenant_name, u.tenant_id,
+             r.name as role_name, u.role_id,
+             u.status
+      FROM users u
+      LEFT JOIN tenants t ON u.tenant_id = t.id
+      LEFT JOIN roles r ON u.role_id = r.id
+      ORDER BY u.id
+    `).all();
   },
-  create({ username, password, name, role }) {
+  create({ username, password, name, role, tenant_id, role_id, status }) {
     const existing = db.prepare('SELECT id FROM users WHERE username = ?').get(username);
     if (existing) throw new Error('UNIQUE constraint failed: users.username');
     const hashed = bcrypt.hashSync(password, 10);
     const result = db.prepare(
-      'INSERT OR IGNORE INTO users (username, password, name, role, created_at) VALUES (?, ?, ?, ?, ?)'
-    ).run(username, hashed, name, role || 'sales', new Date().toISOString());
+      'INSERT OR IGNORE INTO users (username, password, name, role, tenant_id, role_id, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+    ).run(username, hashed, name, role || 'sales', tenant_id, role_id, status || 'active', new Date().toISOString());
     return { id: result.lastInsertRowid };
   },
   delete(id) {
@@ -804,13 +940,42 @@ export const UserOps = {
   },
   findByWechatOpenid(openid) {
     if (!openid) return null;
-    return db.prepare('SELECT * FROM users WHERE wechat_openid = ?').get(openid) || null;
+    return db.prepare(`
+      SELECT u.*, t.name as tenant_name, t.status as tenant_status, r.id as role_id
+      FROM users u
+      LEFT JOIN tenants t ON u.tenant_id = t.id
+      LEFT JOIN roles r ON u.role_id = r.id
+      WHERE u.wechat_openid = ?
+    `).get(openid) || null;
   },
   bindWechatOpenid(userId, openid) {
     const existing = db.prepare('SELECT id FROM users WHERE wechat_openid = ? AND id != ?').get(openid, userId);
     if (existing) return { success: false, error: '该微信已被其他账号绑定' };
     db.prepare('UPDATE users SET wechat_openid = ? WHERE id = ?').run(openid, userId);
     return { success: true };
+  },
+
+  update(id, { role_id, tenant_id, name, status }) {
+    const sets = [];
+    const vals = [];
+    if (role_id !== undefined) { sets.push('role_id = ?'); vals.push(role_id); }
+    if (tenant_id !== undefined) { sets.push('tenant_id = ?'); vals.push(tenant_id); }
+    if (name !== undefined) { sets.push('name = ?'); vals.push(name); }
+    if (status !== undefined) { sets.push('status = ?'); vals.push(status); }
+    if (sets.length === 0) return false;
+    vals.push(id);
+    db.prepare(`UPDATE users SET ${sets.join(', ')} WHERE id = ?`).run(...vals);
+    return true;
+  },
+
+  disable(id) {
+    db.prepare("UPDATE users SET status = 'inactive' WHERE id = ?").run(id);
+    return true;
+  },
+
+  enable(id) {
+    db.prepare("UPDATE users SET status = 'active' WHERE id = ?").run(id);
+    return true;
   },
 };
 
@@ -823,6 +988,10 @@ export const CustomerOps = {
     if (where.owner_id) {
       conditions.push('c.owner_id = ?');
       params.push(where.owner_id);
+    }
+    if (where.tenant_id) {
+      conditions.push('c.tenant_id = ?');
+      params.push(where.tenant_id);
     }
     if (where.keyword) {
       conditions.push('(c.company_name LIKE ? OR c.contact_name LIKE ? OR c.phone LIKE ? OR c.wechat LIKE ? OR c.tags LIKE ?)');
@@ -886,13 +1055,13 @@ export const CustomerOps = {
   create(data) {
     const now = new Date().toISOString();
     const result = db.prepare(
-      `INSERT INTO customers (company_name, contact_name, position, phone, wechat, email, customer_type, grade, status, owner_id, notes, tags, cargo_type, monthly_volume, decision_maker, current_forwarder, pain_points, entry_strategy, last_followup_at, next_followup_at, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO customers (company_name, contact_name, position, phone, wechat, email, customer_type, grade, status, owner_id, tenant_id, notes, tags, cargo_type, monthly_volume, decision_maker, current_forwarder, pain_points, entry_strategy, last_followup_at, next_followup_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       data.company_name, data.contact_name || null, data.position || null,
       data.phone || null, data.wechat || null, data.email || null,
       data.customer_type || null, data.grade || 'D', data.status || 'potential',
-      data.owner_id || null, data.notes || null, data.tags || null,
+      data.owner_id || null, data.tenant_id || null, data.notes || null, data.tags || null,
       data.cargo_type || null, data.monthly_volume || null, data.decision_maker || null,
       data.current_forwarder || null, data.pain_points || null, data.entry_strategy || null,
       null, data.next_followup_at || null, now, now
@@ -953,10 +1122,14 @@ export const CustomerOps = {
     return { id: db.prepare('SELECT last_insert_rowid()').get() };
   },
 
-  getOverdue(userId, isAdmin) {
+  getOverdue(userId, isAdmin, tenantId, isPlatform) {
     const today = new Date().toISOString().slice(0, 10);
     let query = `SELECT c.*, u.name as owner_name FROM customers c LEFT JOIN users u ON c.owner_id = u.id WHERE c.next_followup_at IS NOT NULL AND c.next_followup_at <= ? AND c.status NOT IN ('deal', 'lost')`;
     const params = [today];
+    if (!isPlatform && tenantId) {
+      query += ' AND c.tenant_id = ?';
+      params.push(tenantId);
+    }
     if (!isAdmin) {
       query += ' AND c.owner_id = ?';
       params.push(userId);
@@ -969,10 +1142,14 @@ export const CustomerOps = {
     }));
   },
 
-  getToday(userId, isAdmin) {
+  getToday(userId, isAdmin, tenantId, isPlatform) {
     const today = new Date().toISOString().slice(0, 10);
     let query = `SELECT c.*, u.name as owner_name FROM customers c LEFT JOIN users u ON c.owner_id = u.id WHERE c.next_followup_at = ? AND c.status NOT IN ('deal', 'lost')`;
     const params = [today];
+    if (!isPlatform && tenantId) {
+      query += ' AND c.tenant_id = ?';
+      params.push(tenantId);
+    }
     if (!isAdmin) {
       query += ' AND c.owner_id = ?';
       params.push(userId);
@@ -981,13 +1158,17 @@ export const CustomerOps = {
     return db.prepare(query).all(...params);
   },
 
-  getGradeSuggestions(userId, isAdmin) {
+  getGradeSuggestions(userId, isAdmin, tenantId, isPlatform) {
     const suggestions = [];
     const today = new Date();
     const todayStr = today.toISOString().slice(0, 10);
 
     let query = `SELECT * FROM customers WHERE status NOT IN ('deal', 'lost')`;
     const params = [];
+    if (!isPlatform && tenantId) {
+      query += ' AND tenant_id = ?';
+      params.push(tenantId);
+    }
     if (!isAdmin) {
       query += ' AND owner_id = ?';
       params.push(userId);
@@ -1071,12 +1252,20 @@ export const CustomerOps = {
     return true;
   },
 
-  exportList(userId, isAdmin) {
+  exportList(userId, isAdmin, tenantId, isPlatform) {
     let query = 'SELECT c.*, u.name as owner_name FROM customers c LEFT JOIN users u ON c.owner_id = u.id';
     const params = [];
+    const conditions = [];
+    if (!isPlatform && tenantId) {
+      conditions.push('c.tenant_id = ?');
+      params.push(tenantId);
+    }
     if (!isAdmin) {
-      query += ' WHERE c.owner_id = ?';
+      conditions.push('c.owner_id = ?');
       params.push(userId);
+    }
+    if (conditions.length > 0) {
+      query += ' WHERE ' + conditions.join(' AND ');
     }
     query += ' ORDER BY c.updated_at DESC';
     const rows = db.prepare(query).all(...params);
@@ -1099,15 +1288,23 @@ export const CustomerOps = {
     }));
   },
 
-  exportFollowups(userId, isAdmin) {
+  exportFollowups(userId, isAdmin, tenantId, isPlatform) {
     let query = `SELECT f.*, c.company_name as customer_company, c.contact_name as customer_contact, u.name as user_name
                  FROM followups f
                  LEFT JOIN customers c ON f.customer_id = c.id
                  LEFT JOIN users u ON f.user_id = u.id`;
     const params = [];
+    const conditions = [];
+    if (!isPlatform && tenantId) {
+      conditions.push('c.tenant_id = ?');
+      params.push(tenantId);
+    }
     if (!isAdmin) {
-      query += ' WHERE f.user_id = ?';
+      conditions.push('f.user_id = ?');
       params.push(userId);
+    }
+    if (conditions.length > 0) {
+      query += ' WHERE ' + conditions.join(' AND ');
     }
     query += ' ORDER BY f.followup_date DESC';
     const rows = db.prepare(query).all(...params);
@@ -1124,7 +1321,10 @@ export const CustomerOps = {
     }));
   },
 
-  getSalesList() {
+  getSalesList(tenantId) {
+    if (tenantId) {
+      return db.prepare("SELECT id, name FROM users WHERE role IN ('sales', 'admin') AND tenant_id = ? AND status = 'active' ORDER BY id").all(tenantId);
+    }
     return db.prepare("SELECT id, name FROM users WHERE role IN ('sales', 'admin') ORDER BY id").all();
   },
 };
@@ -1418,7 +1618,7 @@ export const WeeklyReportOps = {
 
 // ===== 看板操作 =====
 export const DashboardOps = {
-  getData(userId, isAdmin, period = 'month') {
+  getData(userId, isAdmin, period = 'month', tenantId) {
     const now = new Date();
     let dateFilter;
     switch (period) {
@@ -1437,9 +1637,17 @@ export const DashboardOps = {
 
     let custQuery = 'SELECT * FROM customers';
     const custParams = [];
+    const custConditions = [];
     if (!isAdmin) {
-      custQuery += ' WHERE owner_id = ?';
+      custConditions.push('owner_id = ?');
       custParams.push(userId);
+    }
+    if (tenantId) {
+      custConditions.push('tenant_id = ?');
+      custParams.push(tenantId);
+    }
+    if (custConditions.length > 0) {
+      custQuery += ' WHERE ' + custConditions.join(' AND ');
     }
     const customers = db.prepare(custQuery).all(...custParams);
     const totalCustomers = customers.length;
@@ -1466,11 +1674,19 @@ export const DashboardOps = {
       funnel[i].conversionRate = prev > 0 ? Math.round((funnel[i].count / prev) * 100) : 0;
     }
 
-    let fuQuery = 'SELECT * FROM followups';
+    let fuQuery = 'SELECT f.* FROM followups f JOIN customers c ON f.customer_id = c.id';
     const fuParams = [];
+    const fuConditions = [];
     if (!isAdmin) {
-      fuQuery += ' WHERE user_id = ?';
+      fuConditions.push('f.user_id = ?');
       fuParams.push(userId);
+    }
+    if (tenantId) {
+      fuConditions.push('c.tenant_id = ?');
+      fuParams.push(tenantId);
+    }
+    if (fuConditions.length > 0) {
+      fuQuery += ' WHERE ' + fuConditions.join(' AND ');
     }
     let followups = db.prepare(fuQuery).all(...fuParams);
     if (dateFilter) {
@@ -1493,7 +1709,9 @@ export const DashboardOps = {
 
     let teamRanking = [];
     if (isAdmin) {
-      const allUsers = db.prepare("SELECT * FROM users WHERE role IN ('sales', 'admin')").all();
+      const allUsers = db.prepare(tenantId
+        ? "SELECT * FROM users WHERE role IN ('sales', 'admin') AND tenant_id = ?"
+        : "SELECT * FROM users WHERE role IN ('sales', 'admin')").all(...(tenantId ? [tenantId] : []));
       teamRanking = allUsers.map(u => {
         const userCustomers = customers.filter(c => c.owner_id === u.id);
         const userFollowups = followups.filter(f => f.user_id === u.id);
@@ -1513,7 +1731,7 @@ export const DashboardOps = {
     return { totalCustomers, statusCounts, gradeCounts, funnel, totalFollowups, methodCounts, pendingFollowups, teamRanking, typeCounts, period };
   },
 
-  getKPI(userId, isAdmin, month) {
+  getKPI(userId, isAdmin, month, tenantId) {
     const now = new Date();
     const targetMonth = month || now.toISOString().slice(0, 7);
     const monthStart = targetMonth + '-01';
@@ -1531,9 +1749,17 @@ export const DashboardOps = {
 
     let custQuery = 'SELECT * FROM customers';
     const custParams = [];
+    const custConditions = [];
     if (!isAdmin) {
-      custQuery += ' WHERE owner_id = ?';
+      custConditions.push('owner_id = ?');
       custParams.push(userId);
+    }
+    if (tenantId) {
+      custConditions.push('tenant_id = ?');
+      custParams.push(tenantId);
+    }
+    if (custConditions.length > 0) {
+      custQuery += ' WHERE ' + custConditions.join(' AND ');
     }
     const customers = db.prepare(custQuery).all(...custParams);
 
@@ -1554,11 +1780,15 @@ export const DashboardOps = {
     const totalEffectiveComms = activities.reduce((s, a) => s + (a.effective_comms || 0), 0);
     const effectiveCommRate = totalCalls > 0 ? Math.round(totalEffectiveComms / totalCalls * 100) : 0;
 
-    let fuQuery = 'SELECT * FROM followups WHERE followup_date >= ? AND followup_date <= ?';
+    let fuQuery = 'SELECT f.* FROM followups f JOIN customers c ON f.customer_id = c.id WHERE f.followup_date >= ? AND f.followup_date <= ?';
     const fuParams = [monthStart, monthEndStr];
     if (!isAdmin) {
-      fuQuery += ' AND user_id = ?';
+      fuQuery += ' AND f.user_id = ?';
       fuParams.push(userId);
+    }
+    if (tenantId) {
+      fuQuery += ' AND c.tenant_id = ?';
+      fuParams.push(tenantId);
     }
     const monthFollowups = db.prepare(fuQuery).all(...fuParams);
     const totalNeedFollowup = monthFollowups.length;
@@ -1615,12 +1845,20 @@ export const DashboardOps = {
     return { month: targetMonth, working_days: workingDays, kpi_items: kpiItems, team_kpi: teamKPI };
   },
 
-  getFunnelDiagnostics(userId, isAdmin) {
+  getFunnelDiagnostics(userId, isAdmin, tenantId) {
     let custQuery = 'SELECT * FROM customers';
     const custParams = [];
+    const custConditions = [];
     if (!isAdmin) {
-      custQuery += ' WHERE owner_id = ?';
+      custConditions.push('owner_id = ?');
       custParams.push(userId);
+    }
+    if (tenantId) {
+      custConditions.push('tenant_id = ?');
+      custParams.push(tenantId);
+    }
+    if (custConditions.length > 0) {
+      custQuery += ' WHERE ' + custConditions.join(' AND ');
     }
     const customers = db.prepare(custQuery).all(...custParams);
 
@@ -1665,26 +1903,87 @@ export const DashboardOps = {
   },
 };
 
+// ===== 租户操作 =====
+export const TenantOps = {
+  findAll() {
+    return db.prepare('SELECT * FROM tenants ORDER BY created_at DESC').all();
+  },
+
+  findById(id) {
+    return db.prepare('SELECT * FROM tenants WHERE id = ?').get(id);
+  },
+
+  findByName(name) {
+    return db.prepare('SELECT * FROM tenants WHERE name = ?').get(name);
+  },
+
+  create({ name, parent_id }) {
+    const existing = this.findByName(name);
+    if (existing) throw new Error(`租户"${name}"已存在`);
+    const now = new Date().toISOString();
+    const result = db.prepare('INSERT INTO tenants (name, status, parent_id, created_at) VALUES (?, ?, ?, ?)')
+      .run(name, 'active', parent_id || null, now);
+    return { id: result.lastInsertRowid, name, status: 'active', parent_id: parent_id || null };
+  },
+
+  /**
+   * 递归获取 tenantId 及其所有后代租户的 ID 列表（含自身）
+   */
+  getDescendantIds(tenantId) {
+    const ids = [tenantId];
+    const children = db.prepare('SELECT id FROM tenants WHERE parent_id = ?').all(tenantId);
+    for (const child of children) {
+      ids.push(...this.getDescendantIds(child.id));
+    }
+    return ids;
+  },
+
+  update(id, { name, status }) {
+    const tenant = this.findById(id);
+    if (!tenant) return false;
+    const newName = name || tenant.name;
+    const newStatus = status || tenant.status;
+    db.prepare('UPDATE tenants SET name = ?, status = ? WHERE id = ?')
+      .run(newName, newStatus, id);
+    return true;
+  },
+
+  disable(id) {
+    db.prepare("UPDATE tenants SET status = 'inactive' WHERE id = ?").run(id);
+  },
+
+  enable(id) {
+    db.prepare("UPDATE tenants SET status = 'active' WHERE id = ?").run(id);
+  },
+};
+
 // ===== 角色操作 =====
 export const RoleOps = {
-  findAll() {
-    return db.prepare('SELECT * FROM roles ORDER BY id').all();
+  findAll(tenantIds) {
+    if (tenantIds && tenantIds.length) {
+      const placeholders = tenantIds.map(() => '?').join(',');
+      return db.prepare(`SELECT r.*, t.name as tenant_name FROM roles r LEFT JOIN tenants t ON r.tenant_id = t.id WHERE r.tenant_id IN (${placeholders}) ORDER BY r.id`).all(...tenantIds);
+    }
+    return db.prepare('SELECT r.*, t.name as tenant_name FROM roles r LEFT JOIN tenants t ON r.tenant_id = t.id ORDER BY r.id').all();
   },
 
   findById(id) {
     return db.prepare('SELECT * FROM roles WHERE id = ?').get(id) || null;
   },
 
-  findByName(name) {
+  findByName(name, tenantId) {
+    if (tenantId) {
+      return db.prepare('SELECT * FROM roles WHERE name = ? AND tenant_id = ?').get(name, tenantId) || null;
+    }
     return db.prepare('SELECT * FROM roles WHERE name = ?').get(name) || null;
   },
 
-  create({ name, description }) {
-    const existing = db.prepare('SELECT id FROM roles WHERE name = ?').get(name);
+  create({ name, description, tenant_id }) {
+    const existing = db.prepare('SELECT id FROM roles WHERE name = ? AND tenant_id = ?').get(name, tenant_id);
     if (existing) throw new Error('UNIQUE constraint failed: roles.name');
     const result = db.prepare(
-      'INSERT INTO roles (name, description, is_system, created_at) VALUES (?, ?, 0, ?)'
-    ).run(name, description || '', new Date().toISOString());
+      'INSERT INTO roles (name, description, is_system, tenant_id, created_at) VALUES (?, ?, 0, ?, ?)'
+    ).run(name, description || '', tenant_id, new Date().toISOString());
     return { id: result.lastInsertRowid };
   },
 
@@ -1710,6 +2009,11 @@ export const RoleOps = {
     });
     deleteAll();
     return true;
+  },
+
+  countUsersByRole(roleId) {
+    const row = db.prepare('SELECT COUNT(*) as cnt FROM users WHERE role_id = ?').get(roleId);
+    return row ? row.cnt : 0;
   },
 
   getMenus(roleId) {
@@ -1738,23 +2042,15 @@ export const RoleOps = {
     setAll();
   },
 
-  getUserMenus(roleName) {
-    if (roleName === 'admin') {
-      return ['/', '/customers', '/reminders', '/daily-report', '/quotes', '/weekly-report', '/yunwuyun', '/tracking', '/shipping-rates', '/wechat', '/sales', '/admin'];
-    }
-    const role = db.prepare('SELECT id FROM roles WHERE name = ?').get(roleName);
-    if (!role) return [];
-    return db.prepare('SELECT menu_key FROM role_menus WHERE role_id = ?').all(role.id).map(r => r.menu_key);
+  getUserMenus(roleId) {
+    if (!roleId) return [];
+    return db.prepare('SELECT menu_key FROM role_menus WHERE role_id = ?').all(roleId).map(r => r.menu_key);
   },
 
-  getUserPermissions(roleName) {
-    if (roleName === 'admin') {
-      return ['data:all'];
-    }
-    const role = db.prepare('SELECT id FROM roles WHERE name = ?').get(roleName);
-    if (!role) return [];
-    return db.prepare('SELECT permission_key FROM role_permissions WHERE role_id = ?').all(role.id).map(r => r.permission_key);
+  getUserPermissions(roleId) {
+    if (!roleId) return [];
+    return db.prepare('SELECT permission_key FROM role_permissions WHERE role_id = ?').all(roleId).map(r => r.permission_key);
   },
 };
 
-export default { initDatabase, getDb, UserOps, CustomerOps, DailyActivityOps, QuoteOps, WeeklyReportOps, DashboardOps, RoleOps };
+export default { initDatabase, getDb, UserOps, TenantOps, CustomerOps, DailyActivityOps, QuoteOps, WeeklyReportOps, DashboardOps, RoleOps };

@@ -34,6 +34,15 @@ const useAuthStore = create((set, get) => ({
     return get().user?.role === 'admin';
   },
 
+  isPlatform: () => {
+    const perms = get().user?.permissions || [];
+    return perms.includes('system:platform');
+  },
+
+  tenantId: () => {
+    return get().user?.tenant_id;
+  },
+
   hasMenu: (menuKey) => {
     const menus = get().user?.menus || [];
     return menus.includes(menuKey);

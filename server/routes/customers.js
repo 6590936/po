@@ -6,6 +6,9 @@ import { authenticateToken } from './auth.js';
 const router = express.Router();
 router.use(authenticateToken);
 
+function hasPerm(perms, key) { return (perms || []).includes(key); }
+function isPlatformAdmin(req) { return !req.user.tenant_id && hasPerm(req.user.permissions, 'system:platform'); }
+
 // 获取客户列表
 router.get('/', (req, res) => {
   const {
@@ -19,8 +22,13 @@ router.get('/', (req, res) => {
   if (status) where.status = status;
   if (customerType) where.customerType = customerType;
 
-  // 销售只能看自己的客户
-  if (req.user.role !== 'admin') {
+  const isPlatform = isPlatformAdmin(req);
+
+  if (!isPlatform) {
+    where.tenant_id = req.user.tenant_id;
+  }
+
+  if (req.user.role !== 'admin' && !isPlatform) {
     where.owner_id = req.user.id;
   } else if (ownerId) {
     const parsed = parseInt(ownerId, 10);
@@ -45,37 +53,43 @@ router.get('/', (req, res) => {
 
 // 超期未跟进提醒
 router.get('/reminders/overdue', (req, res) => {
-  const customers = CustomerOps.getOverdue(req.user.id, req.user.role === 'admin');
+  const isPlatform = isPlatformAdmin(req);
+  const customers = CustomerOps.getOverdue(req.user.id, req.user.role === 'admin' || isPlatform, req.user.tenant_id, isPlatform);
   res.json(customers);
 });
 
 // 今日待跟进
 router.get('/reminders/today', (req, res) => {
-  const customers = CustomerOps.getToday(req.user.id, req.user.role === 'admin');
+  const isPlatform = isPlatformAdmin(req);
+  const customers = CustomerOps.getToday(req.user.id, req.user.role === 'admin' || isPlatform, req.user.tenant_id, isPlatform);
   res.json(customers);
 });
 
 // 导出客户列表
 router.get('/export/list', (req, res) => {
-  const data = CustomerOps.exportList(req.user.id, req.user.role === 'admin');
+  const isPlatform = isPlatformAdmin(req);
+  const data = CustomerOps.exportList(req.user.id, req.user.role === 'admin' || isPlatform, req.user.tenant_id, isPlatform);
   res.json(data);
 });
 
 // 导出跟进记录
 router.get('/export/followups', (req, res) => {
-  const data = CustomerOps.exportFollowups(req.user.id, req.user.role === 'admin');
+  const isPlatform = isPlatformAdmin(req);
+  const data = CustomerOps.exportFollowups(req.user.id, req.user.role === 'admin' || isPlatform, req.user.tenant_id, isPlatform);
   res.json(data);
 });
 
 // 获取销售人员列表
 router.get('/meta/sales', (req, res) => {
-  res.json(CustomerOps.getSalesList());
+  const isPlatform = isPlatformAdmin(req);
+  res.json(CustomerOps.getSalesList(isPlatform ? undefined : req.user.tenant_id));
 });
 
 // 等级智能建议
 router.get('/grade-suggestions', (req, res) => {
   try {
-    const suggestions = CustomerOps.getGradeSuggestions(req.user.id, req.user.role === 'admin');
+    const isPlatform = isPlatformAdmin(req);
+    const suggestions = CustomerOps.getGradeSuggestions(req.user.id, req.user.role === 'admin' || isPlatform, req.user.tenant_id, isPlatform);
     res.json(suggestions);
   } catch (err) {
     console.error('grade-suggestions error:', err);
@@ -89,7 +103,11 @@ router.get('/grade-suggestions', (req, res) => {
 router.get('/:id', (req, res) => {
   const customer = CustomerOps.findById(req.params.id);
   if (!customer) return res.status(404).json({ error: '客户不存在' });
-  if (req.user.role !== 'admin' && customer.owner_id !== req.user.id) {
+  const isPlatform = isPlatformAdmin(req);
+  if (!isPlatform && customer.tenant_id !== req.user.tenant_id) {
+    return res.status(403).json({ error: '无权查看该客户' });
+  }
+  if (req.user.role !== 'admin' && !isPlatform && customer.owner_id !== req.user.id) {
     return res.status(403).json({ error: '无权查看该客户' });
   }
   res.json(customer);
@@ -100,7 +118,7 @@ router.post('/', (req, res) => {
   const { company_name } = req.body;
   if (!company_name) return res.status(400).json({ error: '公司名称不能为空' });
 
-  const result = CustomerOps.create({ ...req.body, owner_id: req.user.id });
+  const result = CustomerOps.create({ ...req.body, owner_id: req.user.id, tenant_id: req.user.tenant_id });
   res.json({ ...result, message: '客户创建成功' });
 });
 
@@ -108,13 +126,16 @@ router.post('/', (req, res) => {
 router.put('/:id', (req, res) => {
   const customer = CustomerOps.findById(req.params.id);
   if (!customer) return res.status(404).json({ error: '客户不存在' });
-  if (req.user.role !== 'admin' && customer.owner_id !== req.user.id) {
+  const isPlatform = isPlatformAdmin(req);
+  if (!isPlatform && customer.tenant_id !== req.user.tenant_id) {
+    return res.status(403).json({ error: '无权修改该客户' });
+  }
+  if (req.user.role !== 'admin' && !isPlatform && customer.owner_id !== req.user.id) {
     return res.status(403).json({ error: '无权修改该客户' });
   }
 
   const data = { ...req.body, _userId: req.user.id };
-  // 管理员可以转移客户
-  if (req.user.role !== 'admin') delete data.owner_id;
+  if (req.user.role !== 'admin' && !isPlatform) delete data.owner_id;
 
   CustomerOps.update(req.params.id, data);
   res.json({ message: '客户更新成功' });
@@ -122,11 +143,15 @@ router.put('/:id', (req, res) => {
 
 // 删除客户（仅管理员）
 router.delete('/:id', (req, res) => {
-  if (req.user.role !== 'admin') {
+  const isPlatform = isPlatformAdmin(req);
+  if (req.user.role !== 'admin' && !isPlatform) {
     return res.status(403).json({ error: '只有管理员可以删除客户' });
   }
   const customer = CustomerOps.findById(req.params.id);
   if (!customer) return res.status(404).json({ error: '客户不存在' });
+  if (!isPlatform && customer.tenant_id !== req.user.tenant_id) {
+    return res.status(403).json({ error: '无权删除该客户' });
+  }
 
   const success = CustomerOps.delete(req.params.id);
   if (success) {
