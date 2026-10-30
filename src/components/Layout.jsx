@@ -89,6 +89,11 @@ function LayoutWrapper({ children }) {
       label: '海运费报价',
     },
     {
+      key: '/fee-templates',
+      icon: <DollarOutlined />,
+      label: '费用模版',
+    },
+    {
       key: '/wechat',
       icon: <WechatOutlined />,
       label: '企业微信推送',

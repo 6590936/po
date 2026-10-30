@@ -53,6 +53,7 @@ export const authAPI = {
     }),
   getMe: () => request('/auth/me'),
   getUsers: () => request('/auth/users'),
+  getUserNames: () => request('/auth/users/names'),
   createUser: (data) =>
     request('/auth/users', {
       method: 'POST',
@@ -186,6 +187,11 @@ export const yunwuyunAPI = {
   enableLogin: (id, login_account, password) => request(`/yunwuyun/customers/${id}/enable-login`, { method: 'PUT', body: JSON.stringify({ login_account, password }) }),
   disableLogin: (id) => request(`/yunwuyun/customers/${id}/disable-login`, { method: 'PUT' }),
   resetCustomerPassword: (id, password) => request(`/yunwuyun/customers/${id}/reset-password`, { method: 'PUT', body: JSON.stringify({ password }) }),
+  assignSales: (id, sales_name) => request(`/yunwuyun/customers/${id}/assign-sales`, { method: 'PUT', body: JSON.stringify({ sales_name }) }),
+  batchAssignSales: (client_ids, sales_name) => request('/yunwuyun/customers/batch-assign-sales', { method: 'POST', body: JSON.stringify({ client_ids, sales_name }) }),
+
+  // 费用模版绑定
+  setFeeTemplate: (id, template_id) => request(`/yunwuyun/customers/${id}/fee-template`, { method: 'PUT', body: JSON.stringify({ template_id }) }),
 };
 
 // 角色管理
@@ -333,4 +339,14 @@ export const shippingRatesAPI = {
   deleteSupplier: (id) => request(`/shipping-rates/suppliers/${id}`, { method: 'DELETE' }),
   getDetails: async (params = {}) => { const query = new URLSearchParams(params).toString(); const token = useAuthStore.getState().token; const resp = await fetch(`/api/shipping-rates/details?${query}`, { headers: { Authorization: `Bearer ${token}` } }); const json = await resp.json(); if (!resp.ok) throw new Error(json.error); return json.data; },
   updateDetail: (id, data) => request(`/shipping-rates/details/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+};
+
+// 费用模版
+export const feeTemplateAPI = {
+  getList: () => request('/fee-templates'),
+  create: (data) => request('/fee-templates', { method: 'POST', body: JSON.stringify(data) }),
+  update: (id, data) => request(`/fee-templates/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  delete: (id) => request(`/fee-templates/${id}`, { method: 'DELETE' }),
+  setDefault: (id) => request(`/fee-templates/${id}/set-default`, { method: 'PUT' }),
+  copy: (id) => request('/fee-templates/copy', { method: 'POST', body: JSON.stringify({ id }) }),
 };

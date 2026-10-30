@@ -350,7 +350,7 @@ function ClientPortal() {
                         style={{ marginBottom: 12 }}
                         items={pols.map(pol => ({
                           key: pol,
-                          label: <Space size={4}><Tag color="blue" style={{ margin: 0 }}>{pol}</Tag><Text type="secondary" style={{ fontSize: 12 }}>{polMap[pol].length}港</Text></Space>,
+                          label: <Space size={4}><Tag color="blue" style={{ margin: 0 }}>{pol}</Tag><Text type="secondary" style={{ fontSize: 12 }}>{polMap[pol].reduce((s, b) => s + (b.items || []).length, 0)}船</Text></Space>,
                         }))}
                       />
                       {Object.entries(podMap).map(([pod, batches]) => (
@@ -364,7 +364,12 @@ function ClientPortal() {
                               {[...new Set(batches.map(b => b.container_type))].map(ct => (
                                 <Tag key={ct}>{ct}</Tag>
                               ))}
-                              <Text type="secondary" style={{ fontSize: 12 }}>{batches.length} 个批次</Text>
+                              <Text type="secondary" style={{ fontSize: 12 }}>
+                                {batches.reduce((s, b) => s + (b.items || []).length, 0)}条船 · {(() => {
+                                  const dates = batches.map(b => b.valid_from).filter(Boolean).sort();
+                                  return dates.length ? dates[0]?.slice(0, 10) + ' ~ ' + dates[dates.length - 1]?.slice(0, 10) : '';
+                                })()}
+                              </Text>
                             </Space>
                           }
                         >
@@ -382,7 +387,8 @@ function ClientPortal() {
                               { title: '海运费(USD)', dataIndex: 'freight_rate', width: 120, align: 'right', render: v => v ? <Text strong style={{ color: '#cf1322' }}>$ {v.toLocaleString()}</Text> : '-' },
                               { title: '航程', dataIndex: 'transit_days', width: 70, render: v => v ? <Tag color="purple">{v}天</Tag> : '-' },
                               { title: '备注', dataIndex: 'remarks', width: 100, render: v => v ? <Tag color="orange">{v}</Tag> : '-' },
-                              { title: '操作', key: 'act', width: 80, render: (_, r) => <Button type="link" size="small" icon={<DollarOutlined />} onClick={() => handlePreviewQuotation(r._batchId, r.id)}>报价单</Button> },
+                              // TODO: 操作列暂时隐藏，需恢复时取消注释即可
+                              // { title: '操作', key: 'act', width: 80, render: (_, r) => <Button type="link" size="small" icon={<DollarOutlined />} onClick={() => handlePreviewQuotation(r._batchId, r.id)}>报价单</Button> },
                             ]}
                           />
                         </Card>

@@ -1,7 +1,7 @@
 // 认证路由
 import express from 'express';
 import jwt from 'jsonwebtoken';
-import { UserOps, RoleOps, TenantOps } from '../database.js';
+import { UserOps, RoleOps, TenantOps, getDb } from '../database.js';
 import { logAudit } from '../logger.js';
 
 const router = express.Router();
@@ -37,7 +37,7 @@ router.post('/login', (req, res) => {
 
   if (!menus.length && user.role === 'admin') {
     permissions = ['data:all', 'system:platform', 'shipping:active', 'shipping:batches', 'shipping:detail'];
-    menus = ['/', '/customers', '/shipping-rates', '/wechat', '/sales', '/admin'];
+    menus = ['/', '/customers', '/shipping-rates', '/fee-templates', '/wechat', '/sales', '/admin'];
   }
 
   const token = jwt.sign(
@@ -85,7 +85,7 @@ router.get('/me', authenticateToken, (req, res) => {
     tenant_id: user.tenant_id,
     tenant_name: user.tenant_name,
     created_at: user.created_at,
-    menus: (() => { const m = RoleOps.getUserMenus(user.role_id); return (!m.length && user.role === 'admin') ? ['/', '/customers', '/shipping-rates', '/wechat', '/sales', '/admin'] : m; })(),
+    menus: (() => { const m = RoleOps.getUserMenus(user.role_id); return (!m.length && user.role === 'admin') ? ['/', '/customers', '/shipping-rates', '/fee-templates', '/wechat', '/sales', '/admin'] : m; })(),
     permissions: (() => { const p = RoleOps.getUserPermissions(user.role_id); return (!p.length && user.role === 'admin') ? ['data:all', 'system:platform', 'shipping:active', 'shipping:batches', 'shipping:detail'] : p; })(),
   });
 });
@@ -95,6 +95,18 @@ router.get('/users', authenticateToken, requireAdmin, (req, res) => {
   const platform = isPlatform(req);
   const tids = platform ? undefined : TenantOps.getDescendantIds(req.user.tenant_id);
   const users = UserOps.findAll(tids);
+  res.json(users);
+});
+
+// 获取用户名称列表（所有登录用户可用，用于分配销售员等场景）
+router.get('/users/names', authenticateToken, (req, res) => {
+  const db = getDb();
+  let users;
+  if (req.user.tenant_id) {
+    users = db.prepare('SELECT id, name, username FROM users WHERE tenant_id = ? AND status = ? ORDER BY name').all(req.user.tenant_id, 'active');
+  } else {
+    users = db.prepare('SELECT id, name, username FROM users WHERE status = ? ORDER BY name').all('active');
+  }
   res.json(users);
 });
 
@@ -284,7 +296,7 @@ router.post('/wechat-login', async (req, res) => {
     let menus2 = RoleOps.getUserMenus(user.role_id);
     if (!menus2.length && user.role === 'admin') {
       permissions2 = ['data:all', 'system:platform', 'shipping:active', 'shipping:batches', 'shipping:detail'];
-      menus2 = ['/', '/customers', '/shipping-rates', '/wechat', '/sales', '/admin'];
+      menus2 = ['/', '/customers', '/shipping-rates', '/fee-templates', '/wechat', '/sales', '/admin'];
     }
 
     const token = jwt.sign(

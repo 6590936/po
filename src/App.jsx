@@ -19,6 +19,7 @@ import WechatPush from './pages/WechatPush';
 import SalesManagement from './pages/SalesManagement';
 import Tracking from '../trajectory/Tracking.jsx';
 import ShippingRates from './pages/ShippingRates';
+import FeeTemplates from './pages/FeeTemplates';
 
 function App() {
   const user = useAuthStore((s) => s.user);
@@ -99,6 +100,11 @@ function App() {
           <Route path="/shipping-rates" element={
             <LayoutWrapper>
               <ShippingRates />
+            </LayoutWrapper>
+          } />
+          <Route path="/fee-templates" element={
+            <LayoutWrapper>
+              <FeeTemplates />
             </LayoutWrapper>
           } />
         </>

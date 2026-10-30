@@ -14,6 +14,7 @@ const ALL_MENUS = [
   { key: '/yunwuyun', label: 'FMS数据同步' },
   { key: '/tracking', label: '轨迹查验' },
   { key: '/shipping-rates', label: '海运费报价' },
+  { key: '/fee-templates', label: '费用模版' },
   { key: '/wechat', label: '企业微信推送' },
   { key: '/sales', label: '销售管理' },
   { key: '/admin', label: '平台管理' },

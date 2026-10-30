@@ -640,6 +640,8 @@ function createTables() {
 
   try { db.exec("ALTER TABLE fee_template_items ADD COLUMN category TEXT DEFAULT 'fee'"); } catch {}
 
+  try { db.exec("ALTER TABLE yunwuyun_customers ADD COLUMN fee_template_id INTEGER REFERENCES fee_templates(id)"); } catch {}
+
   try {
     const roles = db.prepare('SELECT id FROM roles').all();
     const insertMenu = db.prepare('INSERT OR IGNORE INTO role_menus (role_id, menu_key) VALUES (?, ?)');

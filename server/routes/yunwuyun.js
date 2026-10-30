@@ -9,6 +9,11 @@ const router = express.Router();
 
 router.use(authenticateToken);
 
+function isSales(req) {
+  const perms = req.user.permissions || [];
+  return req.user.role !== 'admin' && !perms.includes('data:all');
+}
+
 // 测试连接
 router.get('/test', async (req, res) => {
   try {
@@ -151,6 +156,12 @@ router.get('/orders', async (req, res) => {
 
     let where = '1=1';
     const params = [];
+
+    if (isSales(req)) {
+      where += ' AND o.client_id IN (SELECT client_id FROM yunwuyun_customers WHERE sales_name = ?)';
+      params.push(req.user.name);
+    }
+
     if (search) {
       where += ' AND (job_no LIKE ? OR client_name LIKE ? OR client_code LIKE ?)';
       params.push(`%${search}%`, `%${search}%`, `%${search}%`);
@@ -160,7 +171,7 @@ router.get('/orders', async (req, res) => {
       params.push(parseInt(status));
     }
 
-    const total = db.prepare(`SELECT COUNT(*) as cnt FROM yunwuyun_orders WHERE ${where}`).get(...params).cnt;
+    const total = db.prepare(`SELECT COUNT(*) as cnt FROM yunwuyun_orders o WHERE ${where}`).get(...params).cnt;
     const rows = db.prepare(`
       SELECT o.*, t.success AS has_tracking, t.status AS tracking_status, t.status_label AS tracking_status_label
       FROM yunwuyun_orders o
@@ -186,6 +197,12 @@ router.get('/customers', async (req, res) => {
 
     let where = '1=1';
     const params = [];
+
+    if (isSales(req)) {
+      where += ' AND sales_name = ?';
+      params.push(req.user.name);
+    }
+
     if (search) {
       where += ` AND (
         client_name LIKE ? OR client_code LIKE ? OR client_abbr LIKE ?
@@ -202,7 +219,7 @@ router.get('/customers', async (req, res) => {
     }
 
     const total = db.prepare(`SELECT COUNT(*) as cnt FROM yunwuyun_customers WHERE ${where}`).get(...params).cnt;
-    const rows = db.prepare(`SELECT * FROM yunwuyun_customers WHERE ${where} ORDER BY client_name LIMIT ? OFFSET ?`).all(...params, size, offset);
+    const rows = db.prepare(`SELECT c.*, ft.name AS fee_template_name FROM yunwuyun_customers c LEFT JOIN fee_templates ft ON c.fee_template_id = ft.id WHERE ${where} ORDER BY c.client_name LIMIT ? OFFSET ?`).all(...params, size, offset);
     res.json({ success: true, data: { list: rows, total, page, size } });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -235,10 +252,26 @@ router.get('/customers/filters', async (req, res) => {
 router.get('/stats', async (req, res) => {
   try {
     const db = getDb();
-    const orderCount = db.prepare('SELECT COUNT(*) as cnt FROM yunwuyun_orders').get().cnt;
-    const customerCount = db.prepare('SELECT COUNT(*) as cnt FROM yunwuyun_customers').get().cnt;
-    const totals = db.prepare('SELECT SUM(ar_amt) as total_ar, SUM(ap_amt) as total_ap, SUM(gr_oss) as total_profit FROM yunwuyun_orders').get();
-    const statusCounts = db.prepare('SELECT order_status, COUNT(*) as cnt FROM yunwuyun_orders GROUP BY order_status').all();
+    let orderCount, customerCount, totals, statusCounts;
+    if (isSales(req)) {
+      const clientIds = db.prepare('SELECT client_id FROM yunwuyun_customers WHERE sales_name = ?').all(req.user.name).map(r => r.client_id);
+      customerCount = clientIds.length;
+      if (clientIds.length) {
+        const placeholders = clientIds.map(() => '?').join(',');
+        orderCount = db.prepare(`SELECT COUNT(*) as cnt FROM yunwuyun_orders WHERE client_id IN (${placeholders})`).get(...clientIds).cnt;
+        totals = db.prepare(`SELECT SUM(ar_amt) as total_ar, SUM(ap_amt) as total_ap, SUM(gr_oss) as total_profit FROM yunwuyun_orders WHERE client_id IN (${placeholders})`).get(...clientIds);
+        statusCounts = db.prepare(`SELECT order_status, COUNT(*) as cnt FROM yunwuyun_orders WHERE client_id IN (${placeholders}) GROUP BY order_status`).all(...clientIds);
+      } else {
+        orderCount = 0;
+        totals = { total_ar: 0, total_ap: 0, total_profit: 0 };
+        statusCounts = [];
+      }
+    } else {
+      orderCount = db.prepare('SELECT COUNT(*) as cnt FROM yunwuyun_orders').get().cnt;
+      customerCount = db.prepare('SELECT COUNT(*) as cnt FROM yunwuyun_customers').get().cnt;
+      totals = db.prepare('SELECT SUM(ar_amt) as total_ar, SUM(ap_amt) as total_ap, SUM(gr_oss) as total_profit FROM yunwuyun_orders').get();
+      statusCounts = db.prepare('SELECT order_status, COUNT(*) as cnt FROM yunwuyun_orders GROUP BY order_status').all();
+    }
     res.json({
       success: true,
       data: {
@@ -424,6 +457,63 @@ router.put('/customers/:id', async (req, res) => {
     vals.push(req.params.id);
     db.prepare(`UPDATE yunwuyun_customers SET ${sets.join(', ')} WHERE client_id = ?`).run(...vals);
     res.json({ success: true, data: {} });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 分配销售员
+router.put('/customers/:id/assign-sales', async (req, res) => {
+  try {
+    const { sales_name } = req.body;
+    if (!sales_name && sales_name !== '') {
+      return res.json({ success: false, error: '请提供销售员名称' });
+    }
+    const db = getDb();
+    const existing = db.prepare('SELECT * FROM yunwuyun_customers WHERE client_id = ?').get(req.params.id);
+    if (!existing) return res.status(404).json({ success: false, error: '客户不存在' });
+    db.prepare('UPDATE yunwuyun_customers SET sales_name = ? WHERE client_id = ?').run(sales_name, req.params.id);
+    res.json({ success: true, data: { sales_name } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 批量分配销售员
+router.post('/customers/batch-assign-sales', async (req, res) => {
+  try {
+    const { client_ids, sales_name } = req.body;
+    if (!client_ids || !client_ids.length) {
+      return res.json({ success: false, error: '请选择至少一个客户' });
+    }
+    if (!sales_name && sales_name !== '') {
+      return res.json({ success: false, error: '请提供销售员名称' });
+    }
+    const db = getDb();
+    const placeholders = client_ids.map(() => '?').join(',');
+    const result = db.prepare(`UPDATE yunwuyun_customers SET sales_name = ? WHERE client_id IN (${placeholders})`).run(sales_name, ...client_ids);
+    res.json({ success: true, data: { updated: result.changes } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 绑定费用模版
+router.put('/customers/:id/fee-template', async (req, res) => {
+  try {
+    const { template_id } = req.body;
+    const db = getDb();
+    const existing = db.prepare('SELECT * FROM yunwuyun_customers WHERE client_id = ?').get(req.params.id);
+    if (!existing) return res.status(404).json({ success: false, error: '客户不存在' });
+    if (template_id) {
+      const tpl = db.prepare('SELECT id, name FROM fee_templates WHERE id = ?').get(template_id);
+      if (!tpl) return res.status(404).json({ success: false, error: '模版不存在' });
+      db.prepare('UPDATE yunwuyun_customers SET fee_template_id = ? WHERE client_id = ?').run(template_id, req.params.id);
+      res.json({ success: true, data: { fee_template_id: template_id, fee_template_name: tpl.name } });
+    } else {
+      db.prepare('UPDATE yunwuyun_customers SET fee_template_id = NULL WHERE client_id = ?').run(req.params.id);
+      res.json({ success: true, data: { fee_template_id: null, fee_template_name: null } });
+    }
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }

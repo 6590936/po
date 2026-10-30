@@ -206,23 +206,98 @@ router.get('/shipping-rates/batches/:id/quotation-preview', authenticateClient, 
     var carrier = item.carrier_name || '';
     var freight = item.freight_rate || 0;
 
-    var templateItems = [
-      { name: '基础海运费（' + pol + '-->' + pod + '）', standard: '按每柜计费', amount: 'USD ' + freight + ' /柜（含AMS+换单费）', note: '主运输核心费用\n根据当日实际价格', currency: 'USD', amount_type: 'freight' },
-      { name: '港口本地杂费（THC+DOC+EBS等）', standard: '按每柜计费', amount: 'RMB 2500 /柜', note: '预提费（提前用箱）、过夜费（装柜要过晚上12点）、待时费（装柜时间超过8小时）、落箱费（码头没有开港，找堆场存放）、预进港（码头没有开港，找黄牛放进港口）、错截费+改单费、加载费、跑空费、滞箱费、车架费用', currency: 'RMB', amount_type: 'fixed' },
-      { name: '关税', standard: '按每柜计费', amount: 'USD 2000 /柜', note: '必缴费用', currency: 'USD', amount_type: 'fixed' },
-      { name: '清关手续费', standard: '按每柜计费', amount: 'USD 220 /柜', note: '必缴费用', currency: 'USD', amount_type: 'fixed' },
-      { name: '报关费', standard: '按每柜计费', amount: 'RMB 350 /票', note: '常规普货报关，不含特殊单证报关', currency: 'RMB', amount_type: 'fixed' },
-      { name: '拖车提柜费（工厂->码头）', standard: '按每柜计费', amount: 'RMB 2600 /柜', note: '如需自提可不收取，也可根据不同的路程对应收取', currency: 'RMB', amount_type: 'fixed' },
-      { name: '尾程派送', standard: '按每柜计费', amount: 'USD 800 /柜', note: '如需自提可不收取', currency: 'USD', amount_type: 'fixed' },
-      { name: '查验风险金', standard: '按每柜计费', amount: 'USD 0 /柜', note: '加收100USD抵扣1000，依次类推（如遇到查验）', currency: 'USD', amount_type: 'fixed' },
-    ];
+    // 取客户绑定的费用模板
+    var customer = db.prepare('SELECT fee_template_id FROM yunwuyun_customers WHERE client_id = ?').get(req.client.client_id);
+    var templateId = customer?.fee_template_id;
 
-    var templateNotes = [
-      { name: '车架费', free: '3天', fee: '约45USD/天', note: '自柜子抵达仓库完成卸柜起计算，至空柜归还船公司为止' },
-      { name: '预提费', free: '—', fee: '约200USD/次', note: '双方确认送仓时间后，若车队已完成港口提柜，因海外仓侧原因无法接收柜子入仓，将产生额外预提费用，该费用按实际发生向客户收取' },
-      { name: '夜存费', free: '—', fee: '约50USD/天', note: '柜子从港口提柜出来后，未能直接送仓，需在堆场/车场临时过夜暂存所产生的费用，按实际发生收取' },
-      { name: '改地址/改派送方式', free: '需提前7天', fee: '可能产生约100USD改单费', note: '客户变更需提前沟通（如更改地址或者改自提）' },
-    ];
+    // 没绑定则用系统默认模板
+    if (!templateId) {
+      var defaultTpl = db.prepare('SELECT id FROM fee_templates WHERE is_default = 1 LIMIT 1').get();
+      templateId = defaultTpl?.id;
+    }
+
+    var templateItems = [];
+    if (templateId) {
+      var rawItems = db.prepare('SELECT * FROM fee_template_items WHERE template_id = ? AND category = ? ORDER BY sort_order, id').all(templateId, 'fee');
+      templateItems = rawItems.map(function(ti) {
+        var amtParts = ti.amount_value ? ti.amount_value.split('|') : ['', ''];
+        var label = amtParts[0] || '';
+        var note = amtParts[1] || ti.note || '';
+        return {
+          name: ti.item_name,
+          standard: ti.standard || '按每柜计费',
+          amount: (ti.currency || 'USD') + ' ' + (label || '0') + (ti.standard ? ' /' + ti.standard.replace('按每', '') : ''),
+          note: note,
+          currency: ti.currency || 'USD',
+          amount_type: ti.amount_type || 'fixed',
+        };
+      });
+
+      // 如果没有 fee 类型的项，或 templateItems 为空，用全量
+      if (!templateItems.length) {
+        rawItems = db.prepare('SELECT * FROM fee_template_items WHERE template_id = ? ORDER BY sort_order, id').all(templateId);
+        templateItems = rawItems.map(function(ti) {
+          var amtParts = ti.amount_value ? ti.amount_value.split('|') : ['', ''];
+          return {
+            name: ti.item_name,
+            standard: ti.standard || '按每柜计费',
+            amount: (ti.currency || 'USD') + ' ' + (amtParts[0] || '0'),
+            note: amtParts[1] || ti.note || '',
+            currency: ti.currency || 'USD',
+            amount_type: ti.amount_type || 'fixed',
+          };
+        });
+      }
+
+      var noteItems = db.prepare('SELECT * FROM fee_template_items WHERE template_id = ? AND category = ? ORDER BY sort_order, id').all(templateId, 'note');
+      var templateNotes = noteItems.map(function(ti) {
+        var amtParts = ti.amount_value ? ti.amount_value.split('|') : ['', ''];
+        return {
+          name: ti.item_name,
+          free: amtParts[0] || ti.standard || '—',
+          fee: amtParts[1] || ti.amount_value || '—',
+          note: ti.note || '',
+        };
+      });
+
+      // 动态替换 freight 类型费项的实际运价和港口
+      templateItems = templateItems.map(function(ti) {
+        var isFreight = ti.amount_type === 'freight' || (ti.name && (ti.name.includes('海运费') || ti.name.includes('运价')));
+        if (isFreight) {
+          return {
+            name: ti.name + '（' + pol + '-->' + pod + '）',
+            standard: ti.standard,
+            amount: (ti.currency || 'USD') + ' ' + freight + ' /柜（含AMS+换单费）',
+            note: '主运输核心费用\n根据当日实际价格',
+            currency: ti.currency || 'USD',
+            amount_type: 'freight',
+          };
+        }
+        return ti;
+      });
+    }
+
+    // 没有任何模板项则用原硬编码兜底
+    if (!templateItems.length) {
+      templateItems = [
+        { name: '基础海运费（' + pol + '-->' + pod + '）', standard: '按每柜计费', amount: 'USD ' + freight + ' /柜（含AMS+换单费）', note: '主运输核心费用\n根据当日实际价格', currency: 'USD', amount_type: 'freight' },
+        { name: '港口本地杂费（THC+DOC+EBS等）', standard: '按每柜计费', amount: 'RMB 2500 /柜', note: '预提费（提前用箱）等', currency: 'RMB', amount_type: 'fixed' },
+        { name: '关税', standard: '按每柜计费', amount: 'USD 2000 /柜', note: '必缴费用', currency: 'USD', amount_type: 'fixed' },
+        { name: '清关手续费', standard: '按每柜计费', amount: 'USD 220 /柜', note: '必缴费用', currency: 'USD', amount_type: 'fixed' },
+        { name: '报关费', standard: '按每柜计费', amount: 'RMB 350 /票', note: '常规普货报关', currency: 'RMB', amount_type: 'fixed' },
+        { name: '拖车提柜费（工厂->码头）', standard: '按每柜计费', amount: 'RMB 2600 /柜', note: '如需自提可不收取', currency: 'RMB', amount_type: 'fixed' },
+        { name: '尾程派送', standard: '按每柜计费', amount: 'USD 800 /柜', note: '如需自提可不收取', currency: 'USD', amount_type: 'fixed' },
+        { name: '查验风险金', standard: '按每柜计费', amount: 'USD 0 /柜', note: '加收100USD抵扣1000', currency: 'USD', amount_type: 'fixed' },
+      ];
+    }
+    if (!templateNotes || !templateNotes.length) {
+      templateNotes = [
+        { name: '车架费', free: '3天', fee: '约45USD/天', note: '自柜子抵达仓库完成卸柜起计算，至空柜归还船公司为止' },
+        { name: '预提费', free: '—', fee: '约200USD/次', note: '双方确认送仓时间后，若车队已完成港口提柜，因海外仓侧原因无法接收柜子入仓，将产生额外预提费用' },
+        { name: '夜存费', free: '—', fee: '约50USD/天', note: '柜子从港口提柜出来后，未能直接送仓，需在堆场/车场临时过夜暂存' },
+        { name: '改地址/改派送方式', free: '需提前7天', fee: '可能产生约100USD改单费', note: '客户变更需提前沟通' },
+      ];
+    }
 
     var usdTotal = 0;
     var rmbTotal = 0;
@@ -237,7 +312,7 @@ router.get('/shipping-rates/batches/:id/quotation-preview', authenticateClient, 
     });
 
     res.json({ success: true, data: {
-      _batchId: req.params.id, _itemId: itemId || '', _templateId: '',
+      _batchId: req.params.id, _itemId: itemId || '', _templateId: String(templateId || ''),
       pol, pod, ct, carrier, vessel: item.vessel_voyage || '', freight,
       items: templateItems, total: { usd: usdTotal, rmb: rmbTotal }, notes: templateNotes,
     }});
@@ -270,46 +345,116 @@ router.get('/shipping-rates/batches/:id/quotation', authenticateClient, (req, re
     var carrier = item.carrier_name || '';
     var freight = item.freight_rate || 0;
 
+    // 取客户绑定的费用模板
+    var customer = db.prepare('SELECT fee_template_id FROM yunwuyun_customers WHERE client_id = ?').get(req.client.client_id);
+    var templateId = customer?.fee_template_id;
+    if (!templateId) {
+      var defaultTpl = db.prepare('SELECT id FROM fee_templates WHERE is_default = 1 LIMIT 1').get();
+      templateId = defaultTpl?.id;
+    }
+
+    var feeItems = [];
+    if (templateId) {
+      feeItems = db.prepare('SELECT * FROM fee_template_items WHERE template_id = ? AND category = ? ORDER BY sort_order, id').all(templateId, 'fee');
+      if (!feeItems.length) feeItems = db.prepare('SELECT * FROM fee_template_items WHERE template_id = ? ORDER BY sort_order, id').all(templateId);
+    }
+
+    // 构建费用明细行
+    var aoa = [[''], ['费用项目', '计费标准', '费用金额', '备注']];
+    var usdSum = freight;
+    var rmbSum = 0;
+    if (feeItems.length) {
+      feeItems.forEach(function(fi) {
+        var itemName = fi.item_name;
+        var amountStr, note;
+        var isFreight = (fi.amount_type || 'fixed') === 'freight' || (fi.item_name && (fi.item_name.includes('海运费') || fi.item_name.includes('运价')));
+        if (isFreight) {
+          itemName = fi.item_name + '（' + pol + '-->' + pod + '）';
+          amountStr = (fi.currency || 'USD') + ' ' + freight + ' /柜（含AMS+换单费）';
+          note = '主运输核心费用\n根据当日实际价格';
+        } else {
+          var amtParts = fi.amount_value ? fi.amount_value.split('|') : ['', ''];
+          amountStr = (fi.currency || 'USD') + ' ' + (amtParts[0] || '0');
+          note = amtParts[1] || fi.note || '';
+          var numMatch = amountStr.match(/([\d,]+)/);
+          if (numMatch) {
+            var num = parseFloat(numMatch[1].replace(/,/g, '')) || 0;
+            if (fi.currency === 'USD' || (fi.currency || 'USD').toUpperCase() === 'USD') usdSum += num;
+            else rmbSum += num;
+          }
+        }
+        aoa.push([itemName, fi.standard || '按每柜计费', amountStr, note]);
+      });
+    } else {
+      aoa.push(
+        ['基础海运费（' + pol + '-->' + pod + '）', '按每柜计费', 'USD ' + freight + ' /柜（含AMS+换单费）', '主运输核心费用\n根据当日实际价格'],
+        ['港口本地杂费（THC+DOC+EBS等）', '按每柜计费', 'RMB 2500 /柜', '预提费（提前用箱）\n过夜费（装柜要过晚上12点）等'],
+        ['关税', '按每柜计费', 'USD 2000 /柜', '必缴费用'],
+        ['清关手续费', '按每柜计费', 'USD 220 /柜', '必缴费用'],
+        ['报关费', '按每柜计费', 'RMB 350 /票', '常规普货报关'],
+        ['拖车提柜费（工厂->码头）', '按每柜计费', 'RMB 2600 /柜', '如需自提可不收取'],
+        ['尾程派送', '按每柜计费', 'USD 800 /柜', '如需自提可不收取'],
+        ['查验风险金', '按每柜计费', 'USD 0 /柜', '加收100USD抵扣1000']
+      );
+      usdSum += 2000 + 220 + 800;
+      rmbSum += 2500 + 350 + 2600;
+    }
+    aoa.push(['合计费用', '一票总计', 'USD ' + usdSum + ' + RMB ' + rmbSum, '']);
+
+    var noteItems = templateId ? db.prepare('SELECT * FROM fee_template_items WHERE template_id = ? AND category = ? ORDER BY sort_order, id').all(templateId, 'note') : [];
+    if (noteItems.length) {
+      aoa.push([''], ['尾程派送注意事项']);
+      aoa.push(['费用项目', '免费期', '超期标准', '备注']);
+      noteItems.forEach(function(ni) {
+        var amtParts = ni.amount_value ? ni.amount_value.split('|') : ['', ''];
+        aoa.push([ni.item_name, amtParts[0] || ni.standard || '—', amtParts[1] || ni.amount_value || '—', ni.note || '']);
+      });
+    } else {
+      aoa.push([''], ['尾程派送注意事项']);
+      aoa.push(['费用项目', '免费期', '超期标准', '备注']);
+      aoa.push(['车架费', '3天', '约45USD/天', '自柜子抵达仓库完成卸柜起计算，至空柜归还船公司为止']);
+      aoa.push(['预提费', '—', '约200USD/次', '双方确认送仓时间后，若车队已完成港口提柜，因海外仓侧原因无法接收柜子入仓']);
+      aoa.push(['夜存费', '—', '约50USD/天', '柜子从港口提柜出来后，未能直接送仓，需在堆场/车场临时过夜暂存']);
+      aoa.push(['改地址/改派送方式', '需提前7天', '可能产生约100USD改单费', '客户变更需提前沟通']);
+    }
+
     var headerStyle = { font: { bold: true, sz: 12, color: { rgb: 'FFFFFF' }, name: '微软雅黑' }, fill: { fgColor: { rgb: '1F4E79' } }, alignment: { horizontal: 'center', vertical: 'center' }, border: { top: { style: 'thin', color: { rgb: '000000' } }, bottom: { style: 'thin', color: { rgb: '000000' } }, left: { style: 'thin', color: { rgb: '000000' } }, right: { style: 'thin', color: { rgb: '000000' } } } };
     var sectionStyle = { font: { bold: true, sz: 11, color: { rgb: 'FFFFFF' }, name: '微软雅黑' }, fill: { fgColor: { rgb: '5B9BD5' } }, alignment: { horizontal: 'center', vertical: 'center' }, border: { top: { style: 'thin', color: { rgb: '000000' } }, bottom: { style: 'thin', color: { rgb: '000000' } }, left: { style: 'thin', color: { rgb: '000000' } }, right: { style: 'thin', color: { rgb: '000000' } } } };
     var totalStyle = { font: { bold: true, sz: 11, name: '微软雅黑' }, fill: { fgColor: { rgb: 'FFF2CC' } }, alignment: { horizontal: 'center', vertical: 'center' }, border: { top: { style: 'thin', color: { rgb: '000000' } }, bottom: { style: 'thin', color: { rgb: '000000' } }, left: { style: 'thin', color: { rgb: '000000' } }, right: { style: 'thin', color: { rgb: '000000' } } } };
     var cellStyle = { font: { sz: 10, name: '微软雅黑' }, alignment: { vertical: 'center', wrapText: true }, border: { top: { style: 'thin', color: { rgb: 'D9D9D9' } }, bottom: { style: 'thin', color: { rgb: 'D9D9D9' } }, left: { style: 'thin', color: { rgb: 'D9D9D9' } }, right: { style: 'thin', color: { rgb: 'D9D9D9' } } } };
 
-    var aoa = [
-      [''], ['费用项目', '计费标准', '费用金额', '备注'],
-      ['基础海运费（' + pol + '-->' + pod + '）', '按每柜计费', 'USD ' + freight + ' /柜（含AMS+换单费）', '主运输核心费用\n根据当日实际价格'],
-      ['港口本地杂费（THC+DOC+EBS等）', '按每柜计费', 'RMB 2500 /柜', '预提费（提前用箱）\n过夜费（装柜要过晚上12点）\n待时费（装柜时间超过8小时）\n落箱费（码头没有开港，找堆场存放）\n预进港（码头没有开港，找黄牛放进港口）\n错截费（船司已经截单资料，柜子没装好）+改单费\n加载费（船司甩柜后，加钱找黄牛上船）\n跑空费（通知柜子已卸空，实际车队提空柜时海外仓未卸空）\n滞箱费（柜子在海外仓时间过长，一般为提出后7天）\n车架费用（柜子车架的使用费用，一般免费3天）'],
-      ['关税', '按每柜计费', 'USD 2000 /柜', '必缴费用'],
-      ['清关手续费', '按每柜计费', 'USD 220 /柜', '必缴费用'],
-      ['报关费', '按每柜计费', 'RMB 350 /票', '常规普货报关，不含特殊单证报关'],
-      ['拖车提柜费（工厂->码头）', '按每柜计费', 'RMB 2600 /柜', '如需自提可不收取，也可根据不同的路程对应收取'],
-      ['尾程派送', '按每柜计费', 'USD 800 /柜', '如需自提可不收取'],
-      ['查验风险金', '按每柜计费', 'USD 0 /柜', '加收100USD抵扣1000，依次类推（如遇到查验）'],
-      ['合计费用', '一票总计', 'USD ' + (freight + 2000 + 220 + 800) + ' + RMB ' + (2500 + 350 + 2600), ''],
-      [''], ['尾程派送注意事项'],
-      ['费用项目', '免费期', '超期标准', '备注'],
-      ['车架费', '3天', '约45USD/天', '自柜子抵达仓库完成卸柜起计算，至空柜归还船公司为止'],
-      ['预提费', '—', '约200USD/次', '双方确认送仓时间后，若车队已完成港口提柜，因海外仓侧原因无法接收柜子入仓，将产生额外预提费用，该费用按实际发生向客户收取'],
-      ['夜存费', '—', '约50USD/天', '柜子从港口提柜出来后，未能直接送仓，需在堆场/车场临时过夜暂存所产生的费用，按实际发生收取'],
-      ['改地址/改派送方式', '需提前7天', '可能产生约100USD改单费', '客户变更需提前沟通（如更改地址或者改自提）'],
-    ];
-
     var ws = XLSX.utils.aoa_to_sheet(aoa);
     ws['!cols'] = [{ wch: 32 }, { wch: 14 }, { wch: 28 }, { wch: 60 }];
-    ws['!rows'] = [];
-    for (var ri = 0; ri < aoa.length; ri++) ws['!rows'][ri] = { hpt: ri === 3 ? 120 : (ri === 12 ? 25 : 22) };
+
+    var feeEndRow = aoa.length - noteItems.length - 3;
 
     var setCellStyle = function(cell, style) { if (cell) cell.s = style; };
     for (var ci = 0; ci <= 3; ci++) setCellStyle(ws[XLSX.utils.encode_cell({ r: 1, c: ci })], headerStyle);
-    for (ci = 0; ci <= 3; ci++) setCellStyle(ws[XLSX.utils.encode_cell({ r: 12, c: ci })], sectionStyle);
-    for (ci = 0; ci <= 3; ci++) setCellStyle(ws[XLSX.utils.encode_cell({ r: 11, c: ci })], totalStyle);
-    for (var row = 2; row <= 10; row++) for (var col = 0; col <= 3; col++) setCellStyle(ws[XLSX.utils.encode_cell({ r: row, c: col })], cellStyle);
-    for (var row2 = 13; row2 <= 17; row2++) for (var col2 = 0; col2 <= 3; col2++) setCellStyle(ws[XLSX.utils.encode_cell({ r: row2, c: col2 })], cellStyle);
+
+    if (noteItems.length) {
+      var noteHeaderRow = feeEndRow + 1;
+      for (ci = 0; ci <= 3; ci++) setCellStyle(ws[XLSX.utils.encode_cell({ r: noteHeaderRow + 1, c: ci })], sectionStyle);
+    }
+
+    setCellStyle(ws[XLSX.utils.encode_cell({ r: feeEndRow, c: 0 })], totalStyle);
+    setCellStyle(ws[XLSX.utils.encode_cell({ r: feeEndRow, c: 1 })], totalStyle);
+    setCellStyle(ws[XLSX.utils.encode_cell({ r: feeEndRow, c: 2 })], totalStyle);
+    setCellStyle(ws[XLSX.utils.encode_cell({ r: feeEndRow, c: 3 })], totalStyle);
+
+    for (var row = 2; row < feeEndRow; row++) for (var col = 0; col <= 3; col++) setCellStyle(ws[XLSX.utils.encode_cell({ r: row, c: col })], cellStyle);
+
+    if (noteItems.length) {
+      var noteHeaderRow = feeEndRow + 1;
+      for (row = noteHeaderRow + 2; row < aoa.length; row++) for (var col2 = 0; col2 <= 3; col2++) setCellStyle(ws[XLSX.utils.encode_cell({ r: row, c: col2 })], cellStyle);
+    }
 
     ws['!merges'] = [
       { s: { r: 1, c: 0 }, e: { r: 1, c: 3 } },
-      { s: { r: 12, c: 0 }, e: { r: 12, c: 3 } },
     ];
+    if (noteItems.length) {
+      var noteHeaderRow = feeEndRow + 1;
+      ws['!merges'].push({ s: { r: noteHeaderRow + 1, c: 0 }, e: { r: noteHeaderRow + 1, c: 3 } });
+    }
 
     var wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, '报价单');

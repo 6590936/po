@@ -13,6 +13,7 @@ import {
   EnvironmentOutlined, CheckCircleFilled, ClockCircleFilled, CopyOutlined,
 } from '@ant-design/icons';
 import { yunwuyunAPI, trackingAPI } from '../api';
+import useAuthStore from '../store/authStore';
 import dayjs from 'dayjs';
 
 const { Title, Text } = Typography;
@@ -78,6 +79,32 @@ function Yunwuyun() {
   const [accountLoading, setAccountLoading] = useState(false);
   const [enableSuccess, setEnableSuccess] = useState(false);
   const [loginUrl, setLoginUrl] = useState('');
+
+  // 分配销售员
+  const [assignModal, setAssignModal] = useState(false);
+  const [assignSalesName, setAssignSalesName] = useState('');
+  const [selectedRowKeys, setSelectedRowKeys] = useState([]);
+  const [userList, setUserList] = useState([]);
+
+  const loadUserList = () => {
+    if (userList.length) return;
+    import('../api').then(({ authAPI }) => {
+      authAPI.getUserNames().then(users => {
+        setUserList(users || []);
+      }).catch(() => {});
+    });
+  };
+
+  // 费用模版
+  const [feeTemplates, setFeeTemplates] = useState([]);
+  const fetchFeeTemplates = () => {
+    if (feeTemplates.length) return;
+    import('../api').then(({ feeTemplateAPI }) => {
+      feeTemplateAPI.getList().then(data => {
+        setFeeTemplates(data || []);
+      }).catch(() => {});
+    });
+  };
 
   // 详情抽屉
   const [detailVisible, setDetailVisible] = useState(false);
@@ -540,6 +567,25 @@ function Yunwuyun() {
     { title: '分类', dataIndex: 'client_class', key: 'client_class', width: 100,
       render: (t) => t || '-' },
     { title: '销售', dataIndex: 'sales_name', key: 'sales_name', width: 100 },
+    { title: '报价模版', dataIndex: 'fee_template_name', key: 'fee_template_name', width: 160,
+      render: (v, r) => (
+        <Select
+          allowClear
+          size="small"
+          style={{ width: '100%' }}
+          placeholder="选择模版"
+          value={r.fee_template_id || undefined}
+          onClick={fetchFeeTemplates}
+          onChange={async (val) => {
+            try {
+              await yunwuyunAPI.setFeeTemplate(r.client_id, val ?? null);
+              fetchCustomers();
+            } catch { message.error('绑定失败'); }
+          }}
+          options={feeTemplates.map(t => ({ label: t.name, value: t.id }))}
+        />
+      ),
+    },
     { title: '操作员', dataIndex: 'op_name', key: 'op_name', width: 100 },
     { title: '客服', dataIndex: 'cs_name', key: 'cs_name', width: 100 },
     { title: '所属组织', dataIndex: 'org_name', key: 'org_name', width: 180, ellipsis: true },
@@ -793,8 +839,16 @@ function Yunwuyun() {
                     </Space>
                   </Col>
                   <Col>
-                    <Button type="primary" icon={<PlusOutlined />}
-                      onClick={() => handleOpenAdd('customer')}>新增客户</Button>
+                    <Space>
+                      <Button type="primary" icon={<PlusOutlined />}
+                        onClick={() => handleOpenAdd('customer')}>新增客户</Button>
+                      {useAuthStore.getState().isAdmin() && (
+                        <Button icon={<TeamOutlined />}
+                          disabled={!selectedRowKeys.length}
+                          onClick={() => { loadUserList(); setAssignModal(true); }}
+                        >分配销售员 {selectedRowKeys.length > 0 ? `(${selectedRowKeys.length})` : ''}</Button>
+                      )}
+                    </Space>
                   </Col>
                 </Row>
                 <Table
@@ -803,6 +857,10 @@ function Yunwuyun() {
                   rowKey="client_id"
                   loading={custLoading}
                   scroll={{ x: 1800 }}
+                  rowSelection={{
+                    selectedRowKeys,
+                    onChange: setSelectedRowKeys,
+                  }}
                   pagination={{
                     current: custParams.page,
                     pageSize: custParams.pageSize,
@@ -1372,6 +1430,46 @@ function Yunwuyun() {
             </>
           )}
         </Spin>
+      </Modal>
+
+      {/* 分配销售员弹窗 */}
+      <Modal
+        title="分配销售员"
+        open={assignModal}
+        onCancel={() => { setAssignModal(false); setAssignSalesName(''); }}
+        onOk={async () => {
+          if (!selectedRowKeys.length) return;
+          try {
+            await yunwuyunAPI.batchAssignSales(selectedRowKeys, assignSalesName);
+            message.success(`已为 ${selectedRowKeys.length} 个客户分配销售员`);
+            setAssignModal(false);
+            setAssignSalesName('');
+            setSelectedRowKeys([]);
+            fetchCustomers();
+          } catch (err) {
+            message.error('分配失败: ' + (err.message || ''));
+          }
+        }}
+        okText="确定"
+        cancelText="取消"
+      >
+        <div style={{ marginBottom: 12 }}>
+          <Text strong>已选择：</Text>
+          <Text>{selectedRowKeys.length} 个客户</Text>
+        </div>
+        <div>
+          <Text strong style={{ display: 'block', marginBottom: 8 }}>销售专员：</Text>
+          <Select
+            showSearch
+            allowClear
+            style={{ width: '100%' }}
+            placeholder="选择或输入销售员名称"
+            value={assignSalesName || undefined}
+            onChange={setAssignSalesName}
+            filterOption={(input, option) => (option?.label || '').toLowerCase().includes(input.toLowerCase())}
+            options={userList.map(u => ({ label: u.name || u.username, value: u.name || u.username }))}
+          />
+        </div>
       </Modal>
 
       {/* 客户账号管理弹窗 */}

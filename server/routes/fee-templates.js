@@ -1,7 +1,10 @@
 import { Router } from 'express';
 import { getDb } from '../database.js';
+import { authenticateToken } from './auth.js';
 
 const router = Router();
+
+router.use(authenticateToken);
 
 function isAdmin(req, res, next) {
   if (req.user && req.user.role === 'admin') return next();
@@ -129,6 +132,42 @@ router.put('/:id/set-default', isAdmin, (req, res) => {
     db.prepare('UPDATE fee_templates SET is_default = 1, updated_at = ? WHERE id = ?')
       .run(new Date().toISOString(), req.params.id);
     res.json({ success: true, data: { message: '设置成功' } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 复制模板
+router.post('/copy', isAdmin, (req, res) => {
+  try {
+    const db = getDb();
+    const templateId = req.body.id;
+    const src = db.prepare('SELECT * FROM fee_templates WHERE id = ?').get(templateId);
+    if (!src) return res.status(404).json({ success: false, error: '模板不存在' });
+
+    const now = new Date().toISOString();
+    const created_by = req.user?.id || 1;
+
+    const doCopy = db.transaction(() => {
+      const result = db.prepare(
+        'INSERT INTO fee_templates (name, is_default, created_by, created_at, updated_at) VALUES (?, 0, ?, ?, ?)'
+      ).run(src.name + ' (副本)', created_by, now, now);
+
+      const newId = result.lastInsertRowid;
+      const items = db.prepare('SELECT * FROM fee_template_items WHERE template_id = ? ORDER BY sort_order, id').all(templateId);
+      const insertItem = db.prepare(
+        'INSERT INTO fee_template_items (template_id, sort_order, item_name, standard, amount_type, amount_value, currency, note, category) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+      );
+      items.forEach((item, idx) => {
+        insertItem.run(newId, idx, item.item_name || '', item.standard || '按每柜计费', item.amount_type || 'fixed', item.amount_value || '', item.currency || 'USD', item.note || '', item.category || 'fee');
+      });
+      return newId;
+    });
+
+    const newId = doCopy();
+    const tpl = db.prepare('SELECT * FROM fee_templates WHERE id = ?').get(newId);
+    tpl.items = db.prepare('SELECT * FROM fee_template_items WHERE template_id = ? ORDER BY sort_order, id').all(newId);
+    res.json({ success: true, data: tpl });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
