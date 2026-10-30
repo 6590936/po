@@ -198,7 +198,12 @@ router.put('/batches/:id', (req, res) => {
 router.delete('/batches/:id', (req, res) => {
   try {
     const db = getDb();
-    db.prepare('DELETE FROM shipping_rate_batches WHERE id = ?').run(req.params.id);
+    const batchId = parseInt(req.params.id);
+    const del = db.transaction(() => {
+      db.prepare('DELETE FROM shipping_rate_items WHERE batch_id = ?').run(batchId);
+      db.prepare('DELETE FROM shipping_rate_batches WHERE id = ?').run(batchId);
+    });
+    del();
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -216,8 +221,12 @@ router.post('/batches/batch-delete', (req, res) => {
       return res.status(400).json({ success: false, error: '单次最多删除100条' });
     }
     const placeholders = ids.map(() => '?').join(',');
-    const result = db.prepare('DELETE FROM shipping_rate_batches WHERE id IN (' + placeholders + ')').run(...ids);
-    res.json({ success: true, data: { deleted: result.changes } });
+    const del = db.transaction(() => {
+      db.prepare('DELETE FROM shipping_rate_items WHERE batch_id IN (' + placeholders + ')').run(...ids);
+      db.prepare('DELETE FROM shipping_rate_batches WHERE id IN (' + placeholders + ')').run(...ids);
+    });
+    del();
+    res.json({ success: true, data: { deleted: ids.length } });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -336,18 +345,20 @@ router.post('/import', upload.single('file'), (req, res) => {
     if (rows.length === 0) return res.status(400).json({ success: false, error: 'Excel文件为空' });
 
     const groups = [];
-    let currentKey = null;
-    let currentPOL = '';
+    const groupMap = {};
     rows.forEach((r, idx) => {
       const pol = r['起运港'] || r['POL'] || '';
       const pod = r['目的港'] || r['POD'] || '';
-      if (pol) currentPOL = pol;
-      if (pod) {
-        groups.push({ pol: currentPOL, pod, rows: [] });
-        currentKey = groups.length - 1;
-      }
-      if (currentKey !== null) {
-        groups[currentKey].rows.push({ ...r, _origIdx: idx });
+      if (!pol || !pod) return;
+      const ct = r['箱型'] || r['箱型'] || '40HQ';
+      const vf = excelDateToStr(r['生效日期'] || r['有效期开始'] || r['FROM'] || '');
+      const vt = excelDateToStr(r['截止日期'] || r['有效期结束'] || r['TO'] || '');
+      const key = `${pol}|${pod}|${ct}|${vf}|${vt}`;
+      if (groupMap[key] !== undefined) {
+        groups[groupMap[key]].rows.push({ ...r, _origIdx: idx });
+      } else {
+        groupMap[key] = groups.length;
+        groups.push({ pol, pod, rows: [{ ...r, _origIdx: idx }] });
       }
     });
 

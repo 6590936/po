@@ -491,7 +491,7 @@ function ShippingRates() {
       title: '有效期', key: 'valid', width: 180,
       render: (_, r) => `${r.validFrom || '-'} ~ ${r.validTo || '-'}`,
     },
-    { title: '批次', key: 'count', width: 60, align: 'center', render: (_, r) => <Text strong>{(r.children || []).length}</Text> },
+    { title: '船数', key: 'count', width: 60, align: 'center', render: (_, r) => <Text strong>{(r.children || []).reduce((s, b) => s + (b.item_count || 0), 0)}</Text> },
     {
       title: '状态', dataIndex: 'status', width: 80,
       render: v => v === 'active' ? <Tag color="green" icon={<CheckCircleOutlined />}>有效</Tag> : <Tag color="default" icon={<MinusCircleOutlined />}>过期</Tag>,
@@ -755,7 +755,7 @@ function ShippingRates() {
                         type="card"
                         size="small"
                         style={{ marginBottom: 12 }}
-                        items={pols.map(pol => ({ key: pol, label: <Space size={4}><Tag color="blue" style={{ margin: 0 }}>{pol}</Tag><Text type="secondary" style={{ fontSize: 12 }}>{polMap[pol].length}港</Text></Space> }))}
+                        items={pols.map(pol => ({ key: pol, label: <Space size={4}><Tag color="blue" style={{ margin: 0 }}>{pol}</Tag><Text type="secondary" style={{ fontSize: 12 }}>{polMap[pol].reduce((s, b) => s + (b.items || []).length, 0)}船</Text></Space> }))}
                       />
                       {Object.entries(podMap).map(([pod, batches]) => (
                         <Card
@@ -768,7 +768,7 @@ function ShippingRates() {
                               {[...new Set(batches.map(b => b.container_type))].map(ct => (
                                 <Tag key={ct}>{ct}</Tag>
                               ))}
-                              <Text type="secondary" style={{ fontSize: 12 }}>{batches.length} 个批次</Text>
+                              <Text type="secondary" style={{ fontSize: 12 }}>{batches.reduce((s, b) => s + (b.items || []).length, 0)} 条船 · {batches[0]?.valid_from || '-'} ~ {batches[0]?.valid_to || '-'}</Text>
                             </Space>
                           }
                         >
@@ -887,7 +887,7 @@ function ShippingRates() {
                   const routeMap = {};
                   batches.forEach(b => {
                     if (!b.pol || !b.pod || !b.valid_from || !b.valid_to) return;
-                    const key = `${b.pol}\x00${b.pod}`;
+                    const key = `${b.pol}\x00${b.pod}\x00${b.valid_from}\x00${b.valid_to}`;
                     if (!routeMap[key]) {
                       routeMap[key] = { pol: b.pol, pod: b.pod, validFrom: b.valid_from, validTo: b.valid_to, status: b.status, createdByName: b.created_by_name, containerTypes: [], children: [] };
                     }
@@ -895,8 +895,7 @@ function ShippingRates() {
                     if (!routeMap[key].containerTypes.includes(b.container_type)) {
                       routeMap[key].containerTypes.push(b.container_type);
                     }
-                    if (b.valid_from < routeMap[key].validFrom) routeMap[key].validFrom = b.valid_from;
-                    if (b.valid_to > routeMap[key].validTo) routeMap[key].validTo = b.valid_to;
+                    if (b.status === 'active' && routeMap[key].status !== 'active') routeMap[key].status = b.status;
                   });
                   const routes = Object.values(routeMap).filter(r => r.children && r.children.length > 0);
 
@@ -908,13 +907,14 @@ function ShippingRates() {
                       rowKey={(r) => `route-${r.pol}|${r.pod}`}
                       summary={(pageData) => {
                         const totalBatches = pageData.reduce((sum, r) => sum + (r.children || []).length, 0);
+                        const totalShips = pageData.reduce((sum, r) => sum + (r.children || []).reduce((s, b) => s + (b.item_count || 0), 0), 0);
                         return (
                           <Table.Summary fixed>
                             <Table.Summary.Row>
                               <Table.Summary.Cell index={0}><Text strong>合计：{pageData.length} 条航线</Text></Table.Summary.Cell>
                               <Table.Summary.Cell index={1} />
                               <Table.Summary.Cell index={2} />
-                              <Table.Summary.Cell index={3} align="center"><Text strong>{totalBatches} 个批次</Text></Table.Summary.Cell>
+                              <Table.Summary.Cell index={3} align="center"><Text strong>{totalShips} 条船</Text></Table.Summary.Cell>
                               <Table.Summary.Cell index={4} />
                               <Table.Summary.Cell index={5} />
                               <Table.Summary.Cell index={6} />
