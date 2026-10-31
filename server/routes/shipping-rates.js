@@ -743,6 +743,7 @@ router.get('/details', (req, res) => {
     const pod = req.query.pod || '';
     const carrier = req.query.carrier || '';
     const supplier = req.query.supplier || '';
+    const vessel = req.query.vessel || '';
     const validFrom = req.query.validFrom || '';
     const validTo = req.query.validTo || '';
 
@@ -752,6 +753,7 @@ router.get('/details', (req, res) => {
     if (pod) { where += ' AND b.pod LIKE ?'; params.push('%' + pod + '%'); }
     if (carrier) { where += ' AND i.carrier_name LIKE ?'; params.push('%' + carrier + '%'); }
     if (supplier) { where += ' AND i.supplier_name LIKE ?'; params.push('%' + supplier + '%'); }
+    if (vessel) { where += ' AND i.vessel_voyage LIKE ?'; params.push('%' + vessel + '%'); }
     if (validFrom) { where += ' AND b.valid_to >= ?'; params.push(validFrom); }
     if (validTo) { where += ' AND b.valid_from <= ?'; params.push(validTo); }
 

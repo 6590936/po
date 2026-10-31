@@ -81,7 +81,7 @@ function ShippingRates() {
   const [detailRows, setDetailRows] = useState([]);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailTotal, setDetailTotal] = useState(0);
-  const [detailParams, setDetailParams] = useState({ page: 1, pageSize: 20, pol: '', pod: '', carrier: '', supplier: '', validFrom: '', validTo: '' });
+  const [detailParams, setDetailParams] = useState({ page: 1, pageSize: 20, pol: '', pod: '', carrier: '', supplier: '', vessel: '', validFrom: '', validTo: '' });
   const [detailEditVisible, setDetailEditVisible] = useState(false);
   const [detailEditRow, setDetailEditRow] = useState(null);
   const [detailEditSaving, setDetailEditSaving] = useState(false);
@@ -1020,7 +1020,7 @@ function ShippingRates() {
         label: <span><FileExcelOutlined /> 报价明细数据</span>,
         children: (
           <Card>
-            <Row gutter={12} style={{ marginBottom: 16 }}>
+            <Row gutter={12} style={{ marginBottom: 8 }}>
               <Col span={4}>
                 <Input placeholder="起运港" allowClear value={detailParams.pol}
                   onChange={e => setDetailParams(prev => ({ ...prev, pol: e.target.value, page: 1 }))} />
@@ -1034,9 +1034,20 @@ function ShippingRates() {
                   onChange={e => setDetailParams(prev => ({ ...prev, carrier: e.target.value, page: 1 }))} />
               </Col>
               <Col span={4}>
+                <Input placeholder="船名航次" allowClear value={detailParams.vessel}
+                  onChange={e => setDetailParams(prev => ({ ...prev, vessel: e.target.value, page: 1 }))} />
+              </Col>
+              <Col span={4}>
                 <Input placeholder="订舱口" allowClear value={detailParams.supplier}
                   onChange={e => setDetailParams(prev => ({ ...prev, supplier: e.target.value, page: 1 }))} />
               </Col>
+              <Col span={4}>
+                <Button type="primary" icon={<SearchOutlined />} onClick={fetchDetails}>
+                  搜索
+                </Button>
+              </Col>
+            </Row>
+            <Row gutter={12} style={{ marginBottom: 12 }}>
               <Col span={6}>
                 <Space>
                   <DatePicker placeholder="有效期起" value={detailParams.validFrom ? dayjs(detailParams.validFrom) : null}
@@ -1046,11 +1057,6 @@ function ShippingRates() {
                     onChange={v => setDetailParams(prev => ({ ...prev, validTo: v ? v.format('YYYY-MM-DD') : '', page: 1 }))} style={{ width: 130 }} />
                 </Space>
               </Col>
-              <Col span={2}>
-                <Button type="primary" icon={<SearchOutlined />} onClick={fetchDetails}>
-                  搜索
-                </Button>
-              </Col>
             </Row>
 
             <Table
@@ -1058,7 +1064,7 @@ function ShippingRates() {
               rowKey="id"
               loading={detailLoading}
               size="small"
-              scroll={{ x: 1100 }}
+              scroll={{ x: 1200 }}
               columns={[
                 { title: '起运港', dataIndex: 'pol', width: 90, render: v => <Tag color="blue">{v}</Tag> },
                 { title: '目的港', dataIndex: 'pod', width: 90, render: v => <Tag color="green">{v}</Tag> },
@@ -1068,6 +1074,13 @@ function ShippingRates() {
                 { title: '船名航次', dataIndex: 'vessel_voyage', width: 160 },
                 { title: '海运费(USD)', dataIndex: 'freight_rate', width: 110, align: 'right', render: v => v ? <Text strong style={{ color: '#cf1322' }}>$ {v.toLocaleString()}</Text> : '-' },
                 { title: '成本(USD)', dataIndex: 'cost_freight', width: 100, align: 'right', render: v => v ? <Text type="secondary">$ {v.toLocaleString()}</Text> : '-' },
+                { title: '利润(USD)', key: 'profit', width: 100, align: 'right',
+                  render: (_, r) => {
+                    const profit = (Number(r.freight_rate) || 0) - (Number(r.cost_freight) || 0);
+                    if (!profit && profit !== 0) return '-';
+                    return <Text style={{ color: profit >= 0 ? '#2E7D32' : '#cf1322' }}>$ {profit.toLocaleString()}</Text>;
+                  },
+                },
                 { title: '航程(天)', dataIndex: 'transit_days', width: 80, render: v => v ? <Tag color="purple">{v}</Tag> : '-' },
                 { title: '订舱口', dataIndex: 'supplier_name', width: 90 },
                 {
