@@ -6,8 +6,36 @@ import XLSX from 'xlsx';
 import { getDb } from '../database.js';
 
 const router = express.Router();
-const JWT_SECRET = process.env.JWT_SECRET || 'meiou-crm-client-secret-2024';
+export const CLIENT_JWT_SECRET = process.env.JWT_SECRET || 'meiou-crm-client-secret-2024';
+const JWT_SECRET = CLIENT_JWT_SECRET;
 const TOKEN_EXPIRY = '24h';
+
+// 客户 token 签发（统一登录与客户门户登录共用）
+export function signClientToken(customer) {
+  return jwt.sign(
+    {
+      client_id: customer.client_id,
+      client_code: customer.client_code,
+      client_name: customer.client_name,
+      login_account: customer.login_account || customer.client_code,
+      type: 'client',
+    },
+    JWT_SECRET,
+    { expiresIn: TOKEN_EXPIRY }
+  );
+}
+
+// 客户信息对外输出（剔除密码等敏感字段）
+export function toClientProfile(customer) {
+  return {
+    client_id: customer.client_id,
+    client_code: customer.client_code,
+    client_name: customer.client_name,
+    client_name_eng: customer.client_name_eng,
+    client_abbr: customer.client_abbr,
+    login_account: customer.login_account || customer.client_code,
+  };
+}
 
 // 客户登录
 router.post('/login', (req, res) => {
@@ -32,28 +60,11 @@ router.post('/login', (req, res) => {
     return res.status(401).json({ error: '密码错误' });
   }
 
-  const token = jwt.sign(
-    {
-      client_id: customer.client_id,
-      client_code: customer.client_code,
-      client_name: customer.client_name,
-      login_account: customer.login_account || customer.client_code,
-      type: 'client',
-    },
-    JWT_SECRET,
-    { expiresIn: TOKEN_EXPIRY }
-  );
+  const token = signClientToken(customer);
 
   res.json({
     token,
-    client: {
-      client_id: customer.client_id,
-      client_code: customer.client_code,
-      client_name: customer.client_name,
-      client_name_eng: customer.client_name_eng,
-      client_abbr: customer.client_abbr,
-      login_account: customer.login_account || customer.client_code,
-    },
+    client: toClientProfile(customer),
   });
 });
 
@@ -112,13 +123,54 @@ router.get('/orders', authenticateClient, (req, res) => {
             transport_type, loadtype, charging_type,
             delivery_country, dest_country, cnt_nos,
             goods_name, pieces, goods_cbm, gross_kgs,
-            ar_amt, ap_amt, freighttons,
+            ar_amt, ap_amt, ar_amt_cy, freighttons,
+            ar_settled_amt, ar_unsettled_amt,
             synced_at
      FROM yunwuyun_orders WHERE ${where}
      ORDER BY job_date DESC LIMIT ? OFFSET ?`
   ).all(...params, size, offset);
 
-  res.json({ success: true, data: rows, total, page, size });
+  const payRows = db.prepare(
+    'SELECT job_id, COALESCE(SUM(amount), 0) AS amt FROM client_payments WHERE client_id = ? GROUP BY job_id'
+  ).all(req.client.client_id);
+  const payMap = new Map(payRows.map((row) => [String(row.job_id), Number(row.amt) || 0]));
+
+  const list = rows.map((r) => {
+    const arCy = Number(r.ar_amt_cy) || Number(r.ar_amt) || 0;
+    const paid = Number(r.ar_settled_amt) || payMap.get(String(r.job_id)) || 0;
+    const unpaid = Number(r.ar_unsettled_amt) > 0
+      ? Number(r.ar_unsettled_amt)
+      : Math.max(0, arCy - paid);
+    return { ...r, ar_amt_cy: arCy, paid_amt: paid, unpaid_amt: unpaid };
+  });
+
+  const summaryRow = db.prepare(`
+    SELECT
+      COALESCE(SUM(CASE WHEN close_status = 20 THEN 0 ELSE COALESCE(ar_amt_cy, ar_amt, 0) END), 0) AS ar_amt_cy,
+      COALESCE(SUM(CASE WHEN close_status = 20 THEN 0
+        ELSE CASE WHEN ar_settled_amt > 0 THEN ar_settled_amt
+                  ELSE COALESCE((SELECT SUM(p.amount) FROM client_payments p WHERE p.job_id = yunwuyun_orders.job_id), 0) END END), 0) AS paid_amt,
+      COALESCE(SUM(CASE WHEN close_status = 20 THEN 0
+        ELSE CASE WHEN ar_unsettled_amt > 0 THEN ar_unsettled_amt
+                  ELSE MAX(0, COALESCE(ar_amt_cy, ar_amt, 0)
+                    - CASE WHEN ar_settled_amt > 0 THEN ar_settled_amt
+                           ELSE COALESCE((SELECT SUM(p.amount) FROM client_payments p WHERE p.job_id = yunwuyun_orders.job_id), 0) END) END END), 0) AS unpaid_amt,
+      COALESCE(SUM(pieces), 0) AS pieces,
+      COALESCE(SUM(goods_cbm), 0) AS goods_cbm,
+      COALESCE(SUM(gross_kgs), 0) AS gross_kgs
+    FROM yunwuyun_orders WHERE ${where}
+  `).get(...params);
+
+  const summary = {
+    ar_amt_cy: Number(summaryRow.ar_amt_cy) || 0,
+    paid_amt: Number(summaryRow.paid_amt) || 0,
+    unpaid_amt: Number(summaryRow.unpaid_amt) || 0,
+    pieces: Number(summaryRow.pieces) || 0,
+    goods_cbm: Number(summaryRow.goods_cbm) || 0,
+    gross_kgs: Number(summaryRow.gross_kgs) || 0,
+  };
+
+  res.json({ success: true, data: list, total, page, size, summary });
 });
 
 // 获取订单详情
@@ -128,7 +180,47 @@ router.get('/orders/:id', authenticateClient, (req, res) => {
     'SELECT * FROM yunwuyun_orders WHERE job_id = ? AND client_id = ?'
   ).get(parseInt(req.params.id), req.client.client_id);
   if (!order) return res.status(404).json({ error: '订单不存在' });
-  res.json(order);
+
+  const arCy = Number(order.ar_amt_cy) || Number(order.ar_amt) || 0;
+  const localPaid = db.prepare(
+    'SELECT COALESCE(SUM(amount), 0) AS amt FROM client_payments WHERE job_id = ?'
+  ).get(order.job_id).amt;
+  const paid = Number(order.ar_settled_amt) || Number(localPaid) || 0;
+  const unpaid = Number(order.ar_unsettled_amt) > 0
+    ? Number(order.ar_unsettled_amt)
+    : Math.max(0, arCy - paid);
+
+  res.json({ ...order, ar_amt_cy: arCy, paid_amt: paid, unpaid_amt: unpaid });
+});
+
+// 获取订单运输轨迹（只读，抓取由内部人员触发）
+router.get('/orders/:id/tracking', authenticateClient, (req, res) => {
+  try {
+    const db = getDb();
+    const jobId = parseInt(req.params.id);
+    const own = db.prepare(
+      'SELECT job_id, carrier_name, bl_no_domestic, bl_no_overseas, carrier_jobno, so_no FROM yunwuyun_orders WHERE job_id = ? AND client_id = ?'
+    ).get(jobId, req.client.client_id);
+    if (!own) return res.status(404).json({ error: '订单不存在' });
+
+    const tracking = db.prepare(
+      'SELECT tracking_no, carrier_code, carrier_name, origin, destination, vessel, voyage, container_no, etd, atd, eta, ata, status, status_label, timeline, queried_at, success, error_msg FROM order_tracking WHERE job_id = ?'
+    ).get(jobId);
+
+    if (!tracking) {
+      return res.json({ success: true, data: { available: false, tracking_no: '', timeline: [], queried_at: null } });
+    }
+
+    let timeline = [];
+    try { timeline = tracking.timeline ? JSON.parse(tracking.timeline) : []; } catch (_) { timeline = []; }
+
+    res.json({
+      success: true,
+      data: { ...tracking, timeline, available: true },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
 // 获取客户订单统计
@@ -140,13 +232,23 @@ router.get('/stats', authenticateClient, (req, res) => {
     'SELECT COUNT(*) as cnt FROM yunwuyun_orders WHERE client_id = ?'
   ).get(clientId).cnt;
 
-  const totalAR = db.prepare(
-    'SELECT COALESCE(SUM(ar_amt), 0) as total FROM yunwuyun_orders WHERE client_id = ?'
+  const arSums = db.prepare(
+    "SELECT COALESCE(SUM(ar_amt_cy), 0) as cy, COALESCE(SUM(ar_amt), 0) as orig FROM yunwuyun_orders WHERE client_id = ? AND (close_status IS NULL OR close_status <> 20)"
+  ).get(clientId);
+  const totalAR = Number(arSums.cy) || Number(arSums.orig);
+
+  const fmsSettled = db.prepare(
+    "SELECT COALESCE(SUM(ar_settled_amt), 0) as total FROM yunwuyun_orders WHERE client_id = ? AND (close_status IS NULL OR close_status <> 20)"
   ).get(clientId).total;
 
-  const totalAP = db.prepare(
-    'SELECT COALESCE(SUM(ap_amt), 0) as total FROM yunwuyun_orders WHERE client_id = ?'
+  const fmsUnsettled = db.prepare(
+    "SELECT COALESCE(SUM(ar_unsettled_amt), 0) as total FROM yunwuyun_orders WHERE client_id = ? AND (close_status IS NULL OR close_status <> 20)"
   ).get(clientId).total;
+
+  const apSums = db.prepare(
+    "SELECT COALESCE(SUM(ap_amt_cy), 0) as cy, COALESCE(SUM(ap_amt), 0) as orig FROM yunwuyun_orders WHERE client_id = ? AND (close_status IS NULL OR close_status <> 20)"
+  ).get(clientId);
+  const totalAP = Number(apSums.cy) || Number(apSums.orig);
 
   const totalVolume = db.prepare(
     'SELECT COALESCE(SUM(goods_cbm), 0) as total FROM yunwuyun_orders WHERE client_id = ?'
@@ -164,8 +266,15 @@ router.get('/stats', authenticateClient, (req, res) => {
     'SELECT job_id, job_no, job_date, vessel, voyage, etd, eta, delivery_country, dest_country FROM yunwuyun_orders WHERE client_id = ? ORDER BY job_date DESC LIMIT 5'
   ).all(clientId);
 
+  const localPaid = db.prepare(
+    'SELECT COALESCE(SUM(amount), 0) as total FROM client_payments WHERE client_id = ?'
+  ).get(clientId).total;
+
+  const totalPaid = Number(fmsSettled) > 0 ? Number(fmsSettled) : Number(localPaid);
+  const totalUnpaid = Number(fmsUnsettled) > 0 ? Number(fmsUnsettled) : Math.max(0, Number(totalAR) - totalPaid);
+
   res.json({
-    totalOrders, totalAR, totalAP, totalVolume, totalPieces, totalGrossKgs, recentOrders,
+    totalOrders, totalAR, totalAP, totalPaid, totalUnpaid, totalVolume, totalPieces, totalGrossKgs, recentOrders,
   });
 });
 

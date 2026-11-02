@@ -209,7 +209,7 @@ function UserManagement() {
     <>
       <Card title={<Space><TeamOutlined /><span>用户管理</span></Space>}
         extra={<Button type="primary" icon={<PlusOutlined />}
-          onClick={() => { form.resetFields(); fetchRoles(); if (!isPlatform) form.setFieldsValue({ tenant_id: user.tenant_id }); setModalVisible(true); }}>创建用户</Button>}>
+          onClick={() => { form.resetFields(); fetchRoles(); fetchTenants(); if (!isPlatform) form.setFieldsValue({ tenant_id: user.tenant_id }); setModalVisible(true); }}>创建用户</Button>}>
         <Table columns={columns} dataSource={users} rowKey="id" loading={loading} pagination={false} size="middle" />
       </Card>
 

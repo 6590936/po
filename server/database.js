@@ -220,6 +220,13 @@ function createTables() {
       ap_count INTEGER DEFAULT 0,
       latest_problem_count INTEGER DEFAULT 0,
       comment_count INTEGER DEFAULT 0,
+      ar_settled_amt REAL DEFAULT 0,
+      ar_unsettled_amt REAL DEFAULT 0,
+      ap_settled_amt REAL DEFAULT 0,
+      ap_unsettled_amt REAL DEFAULT 0,
+      ar_amt_cy REAL DEFAULT 0,
+      ap_amt_cy REAL DEFAULT 0,
+      settled_at TEXT,
       synced_at TEXT NOT NULL
     );
 
@@ -290,6 +297,15 @@ function createTables() {
   try { db.exec('ALTER TABLE yunwuyun_customers ADD COLUMN wechat_chatid TEXT'); } catch (_) {}
   try { db.exec('ALTER TABLE yunwuyun_customers ADD COLUMN wechat_id TEXT'); } catch (_) {}
   try { db.exec('CREATE INDEX IF NOT EXISTS idx_yy_customers_wechat_id ON yunwuyun_customers(wechat_id)'); } catch (_) {}
+
+  // 迁移：为订单表添加 FMS 核销金额字段（已收/未收、已付/未付）
+  try { db.exec('ALTER TABLE yunwuyun_orders ADD COLUMN ar_settled_amt REAL DEFAULT 0'); } catch (_) {}
+  try { db.exec('ALTER TABLE yunwuyun_orders ADD COLUMN ar_unsettled_amt REAL DEFAULT 0'); } catch (_) {}
+  try { db.exec('ALTER TABLE yunwuyun_orders ADD COLUMN ap_settled_amt REAL DEFAULT 0'); } catch (_) {}
+  try { db.exec('ALTER TABLE yunwuyun_orders ADD COLUMN ap_unsettled_amt REAL DEFAULT 0'); } catch (_) {}
+  try { db.exec('ALTER TABLE yunwuyun_orders ADD COLUMN ar_amt_cy REAL DEFAULT 0'); } catch (_) {}
+  try { db.exec('ALTER TABLE yunwuyun_orders ADD COLUMN ap_amt_cy REAL DEFAULT 0'); } catch (_) {}
+  try { db.exec('ALTER TABLE yunwuyun_orders ADD COLUMN settled_at TEXT'); } catch (_) {}
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS tenants (
@@ -396,6 +412,21 @@ function createTables() {
     );
     CREATE INDEX IF NOT EXISTS idx_order_tracking_job ON order_tracking(job_id);
     CREATE INDEX IF NOT EXISTS idx_order_tracking_status ON order_tracking(status);
+
+    -- 客户回款记录（客户端展示已付 / 未付金额）
+    CREATE TABLE IF NOT EXISTS client_payments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      client_id INTEGER NOT NULL,
+      job_id INTEGER,
+      amount REAL NOT NULL DEFAULT 0,
+      currency TEXT DEFAULT 'CNY',
+      paid_at TEXT,
+      remark TEXT,
+      created_by INTEGER,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_client_payments_client ON client_payments(client_id);
+    CREATE INDEX IF NOT EXISTS idx_client_payments_job ON client_payments(job_id);
 
     -- 销售管理模块
     CREATE TABLE IF NOT EXISTS sales_materials (

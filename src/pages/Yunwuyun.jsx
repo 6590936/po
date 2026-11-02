@@ -37,6 +37,38 @@ const CLOSE_STATUS_MAP = {
   20: { text: '已关闭', color: 'default' },
 };
 
+// FMS 原始编码字典（与运物云保持一致的展示口径）
+const JOB_TYPE_MAP = {
+  BFB: '新单下单',
+  BFC: '变更下单',
+  BFA: '新单预订',
+};
+
+const LOADTYPE_MAP = {
+  LOT_FCL: '整柜',
+  LOT_LCL: '拼箱',
+  LOT_BULK: '散货',
+};
+
+const TRANSPORT_TYPE_MAP = {
+  SF: '海运',
+  AF: '空运',
+  TF: '陆运',
+  RY: '铁运',
+};
+
+// 结算方式：10=票结，20=月结
+const SETTLER_TYPE_MAP = {
+  10: '票结',
+  20: '月结',
+  30: '周结',
+};
+
+function dictLabel(map, val) {
+  if (val == null || val === '') return '-';
+  return map[val] || String(val);
+}
+
 function formatMoney(val) {
   if (val == null || val === 0) return '-';
   return val.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -54,12 +86,13 @@ function Yunwuyun() {
   const [settingToken, setSettingToken] = useState(false);
 
   const [stats, setStats] = useState({
-    orderCount: 0, customerCount: 0, totalAR: 0, totalAP: 0, totalProfit: 0,
+    orderCount: 0, customerCount: 0, totalAR: 0, totalAP: 0, totalProfit: 0, totalPaid: 0, totalUnpaid: 0,
   });
 
   // 订单
   const [orders, setOrders] = useState([]);
   const [orderTotal, setOrderTotal] = useState(0);
+  const [orderSummary, setOrderSummary] = useState(null);
   const [orderLoading, setOrderLoading] = useState(false);
   const [orderParams, setOrderParams] = useState({ page: 1, pageSize: 20, search: '', status: '' });
   const [fetchingJobId, setFetchingJobId] = useState(null); // 正在抓取轨迹的订单ID
@@ -124,7 +157,7 @@ function Yunwuyun() {
   const [trackingModal, setTrackingModal] = useState({ visible: false, data: null, loading: false, jobId: null });
   const [orderVisibleCols, setOrderVisibleCols] = useState(() => {
     try {
-      const saved = localStorage.getItem('yunwuyun_order_cols');
+      const saved = localStorage.getItem('yunwuyun_order_cols_v3');
       return saved ? JSON.parse(saved) : null;
     } catch (_) {
       return null;
@@ -140,6 +173,8 @@ function Yunwuyun() {
         totalAR: res.totalAR || 0,
         totalAP: res.totalAP || 0,
         totalProfit: res.totalProfit || 0,
+        totalPaid: res.totalPaid || 0,
+        totalUnpaid: res.totalUnpaid || 0,
       });
     } catch (_) {}
   }, []);
@@ -149,9 +184,15 @@ function Yunwuyun() {
   const fetchOrders = useCallback(async () => {
     setOrderLoading(true);
     try {
-      const res = await yunwuyunAPI.getOrders(orderParams);
+      const res = await yunwuyunAPI.getOrders({
+        page: orderParams.page,
+        size: orderParams.pageSize,
+        search: orderParams.search,
+        status: orderParams.status,
+      });
       setOrders(res.list || []);
       setOrderTotal(res.total || 0);
+      setOrderSummary(res.summary || null);
     } catch (err) {
       message.error('获取订单失败: ' + err.message);
     } finally {
@@ -233,11 +274,94 @@ function Yunwuyun() {
         setDetailType(type);
         setDetailData(res);
         setDetailVisible(true);
+        if (type === 'customer') fetchPaymentData(res.client_id);
+        else { setPaymentSummary(null); setPayments([]); }
       } else {
         message.error('获取详情失败');
       }
     } catch (err) {
       message.error('获取详情失败: ' + err.message);
+    }
+  };
+
+  // 客户回款：汇总 + 明细
+  const [paymentSummary, setPaymentSummary] = useState(null);
+  const [payments, setPayments] = useState([]);
+  const [paymentLoading, setPaymentLoading] = useState(false);
+  const [paymentModal, setPaymentModal] = useState({ visible: false, record: null });
+  const [paymentForm] = Form.useForm();
+
+  const fetchPaymentData = useCallback(async (clientId) => {
+    if (!clientId) return;
+    setPaymentLoading(true);
+    try {
+      const [summary, listRes] = await Promise.all([
+        yunwuyunAPI.getPaymentSummary(clientId),
+        yunwuyunAPI.getPayments({ client_id: clientId, page: 1, size: 50 }),
+      ]);
+      setPaymentSummary(summary || null);
+      setPayments(listRes.list || []);
+    } catch (err) {
+      message.error('获取回款记录失败: ' + err.message);
+    } finally {
+      setPaymentLoading(false);
+    }
+  }, []);
+
+  const handleOpenPayment = (record) => {
+    paymentForm.resetFields();
+    if (record) {
+      paymentForm.setFieldsValue({
+        job_id: record.job_id || undefined,
+        amount: record.amount,
+        currency: record.currency || 'CNY',
+        paid_at: record.paid_at ? dayjs(record.paid_at) : null,
+        remark: record.remark || '',
+      });
+    } else {
+      paymentForm.setFieldsValue({ currency: 'CNY', paid_at: dayjs() });
+    }
+    setPaymentModal({ visible: true, record: record || null });
+  };
+
+  const handleSavePayment = async () => {
+    try {
+      const values = await paymentForm.validateFields();
+      const payload = {
+        client_id: detailData.client_id,
+        job_id: values.job_id || null,
+        amount: values.amount,
+        currency: values.currency || 'CNY',
+        paid_at: values.paid_at ? values.paid_at.format('YYYY-MM-DD') : null,
+        remark: values.remark || '',
+      };
+      if (paymentModal.record) {
+        await yunwuyunAPI.updatePayment(paymentModal.record.id, payload);
+        message.success('回款已更新');
+      } else {
+        await yunwuyunAPI.createPayment(payload);
+        message.success('回款已登记');
+      }
+      setPaymentModal({ visible: false, record: null });
+      paymentForm.resetFields();
+      fetchPaymentData(detailData.client_id);
+      fetchStats();
+      fetchOrders();
+    } catch (err) {
+      if (err && err.errorFields) return;
+      message.error('保存失败: ' + err.message);
+    }
+  };
+
+  const handleDeletePayment = async (id) => {
+    try {
+      await yunwuyunAPI.deletePayment(id);
+      message.success('回款记录已删除');
+      fetchPaymentData(detailData.client_id);
+      fetchStats();
+      fetchOrders();
+    } catch (err) {
+      message.error('删除失败: ' + err.message);
     }
   };
 
@@ -428,19 +552,81 @@ function Yunwuyun() {
   };
 
   const ALL_ORDER_COLUMNS = [
-    { key: 'job_no', title: '工作单号', dataIndex: 'job_no', width: 140, fixed: 'left',
+    // ---- FMS 运物云订单列表主视图列（图1 顺序） ----
+    { key: 'job_date', title: '工作单日期', dataIndex: 'job_date', width: 105,
+      render: (t) => (t ? dayjs(t).format('YYYY-MM-DD') : '-') },
+    { key: 'job_type', title: '类型', dataIndex: 'job_type', width: 95,
+      render: (t) => dictLabel(JOB_TYPE_MAP, t) },
+    { key: 'job_no', title: '工作号', dataIndex: 'job_no', width: 135, fixed: 'left',
       render: (t) => <Text strong>{t}</Text> },
-    { key: 'so_no', title: '订舱号', dataIndex: 'so_no', width: 130,
-      render: (t) => t || '-' },
-    { key: 'client_name', title: '客户', dataIndex: 'client_name', width: 120,
+    { key: 'cnt_nos', title: '柜号', dataIndex: 'cnt_nos', width: 125,
+      render: (t) => (t ? <Tooltip title={t}><Text style={{ fontSize: 12 }}>{t}</Text></Tooltip> : '-') },
+    { key: 'booking_agent_name', title: '预订舱代理', dataIndex: 'booking_agent_name', width: 150, ellipsis: true,
+      render: (t) => (t ? <Tooltip title={t}>{t}</Tooltip> : '-') },
+    { key: 'loadtype', title: '装柜类型', dataIndex: 'loadtype', width: 90,
+      render: (t) => dictLabel(LOADTYPE_MAP, t) },
+    { key: 'client_name', title: '客户', dataIndex: 'client_name', width: 150, ellipsis: true,
       render: (t, r) => <Tooltip title={r.client_code}>{t}</Tooltip> },
-    { key: 'job_type', title: '业务类型', dataIndex: 'job_type', width: 80 },
-    { key: 'transport_type', title: '运输方式', dataIndex: 'transport_type', width: 80,
+    { key: 'so_no', title: '订舱号', dataIndex: 'so_no', width: 125,
       render: (t) => t || '-' },
-    { key: 'loadtype', title: '装柜方式', dataIndex: 'loadtype', width: 80,
+    { key: 'warehouse_code', title: '派送仓库', dataIndex: 'warehouse_code', width: 140, ellipsis: true,
+      render: (t) => (t ? <Tooltip title={t}>{t}</Tooltip> : '-') },
+    { key: 'ar_amt', title: '应收(本位币)', dataIndex: 'ar_amt_cy', width: 120, align: 'right',
+      render: (v) => <Text style={{ color: v > 0 ? '#1677ff' : '#999' }}>{formatMoney(v)}</Text> },
+    { key: 'ap_amt', title: '应付(本位币)', dataIndex: 'ap_amt_cy', width: 120, align: 'right',
+      render: (v) => <Text style={{ color: v > 0 ? '#ff4d4f' : '#999' }}>{formatMoney(v)}</Text> },
+    { key: 'gr_oss', title: '毛利(本位币)', dataIndex: 'gr_oss', width: 115, align: 'right',
+      render: (v, r) => {
+        const cy = Number(r.ar_amt_cy) - Number(r.ap_amt_cy);
+        const gross = Number(r.ar_amt_cy) || Number(r.ap_amt_cy) ? cy : Number(v) || 0;
+        const color = gross > 0 ? '#52c41a' : gross < 0 ? '#ff4d4f' : '#999';
+        return <Text style={{ color }}>{formatMoney(gross)}</Text>;
+      }},
+    { key: 'paid_amt', title: '已收', dataIndex: 'paid_amt', width: 105, align: 'right',
+      render: (v, r) => (Number(r.ar_amt_cy) > 0
+        ? <Text style={{ color: v > 0 ? '#52c41a' : '#bbb' }}>{formatMoney(v)}</Text>
+        : <Text style={{ color: '#bbb' }}>-</Text>) },
+    { key: 'unpaid_amt', title: '未收', dataIndex: 'unpaid_amt', width: 105, align: 'right',
+      render: (v, r) => {
+        if (r.close_status === 20) return <Text style={{ color: '#bbb' }}>已关闭</Text>;
+        if (!(Number(r.ar_amt_cy) > 0)) return <Text style={{ color: '#bbb' }}>-</Text>;
+        return <Text style={{ color: v > 0 ? '#fa8c16' : '#52c41a' }}>{v > 0 ? formatMoney(v) : '已结清'}</Text>;
+      }},
+    { key: 'client_settler_type', title: '结算方式', dataIndex: 'client_settler_type', width: 95,
+      render: (t) => dictLabel(SETTLER_TYPE_MAP, t) },
+    { key: 'inserted_by', title: '创建人', dataIndex: 'inserted_by', width: 90,
       render: (t) => t || '-' },
-    { key: 'vessel', title: '船名', dataIndex: 'vessel', width: 150, ellipsis: true },
-    { key: 'voyage', title: '航次', dataIndex: 'voyage', width: 80 },
+    // ---- 图2 明细视图列（默认收起，可在列设置里打开） ----
+    { key: 'client_code', title: '客户编码', dataIndex: 'client_code', width: 110,
+      render: (t) => t || '-' },
+    { key: 'client_abbr', title: '客户简称', dataIndex: 'client_abbr', width: 100,
+      render: (t) => t || '-' },
+    { key: 'carrier_name', title: '船/航司', dataIndex: 'carrier_name', width: 120,
+      render: (t) => t || '-' },
+    { key: 'vessel_voyage', title: '船名/航次', width: 170, ellipsis: true,
+      render: (_, r) => {
+        const vv = [r.vessel, r.voyage].filter(Boolean).join(' / ');
+        return vv ? <Tooltip title={vv}>{vv}</Tooltip> : '-';
+      }},
+    { key: 'vessel', title: '船名', dataIndex: 'vessel', width: 150, ellipsis: true,
+      render: (t) => t || '-' },
+    { key: 'voyage', title: '航次', dataIndex: 'voyage', width: 90,
+      render: (t) => t || '-' },
+    { key: 'etd', title: 'ETD', dataIndex: 'etd', width: 110,
+      render: (t) => (t ? dayjs(t).format('YYYY-MM-DD') : '-') },
+    { key: 'eta', title: 'ETA', dataIndex: 'eta', width: 110,
+      render: (t) => (t ? dayjs(t).format('YYYY-MM-DD') : '-') },
+    { key: 'channel_receive_code', title: '收货渠道', dataIndex: 'channel_receive_code', width: 120,
+      render: (t) => t || '-' },
+    { key: 'supply_channel_code', title: '供应渠道', dataIndex: 'supply_channel_code', width: 120,
+      render: (t) => t || '-' },
+    { key: 'carrier_jobno', title: '承运商单号', dataIndex: 'carrier_jobno', width: 140,
+      render: (t) => t || '-' },
+    { key: 'job_remarks', title: '备注1', dataIndex: 'job_remarks', width: 160, ellipsis: true,
+      render: (t) => (t ? <Tooltip title={t}>{t}</Tooltip> : '-') },
+    // ---- 其他辅助列 ----
+    { key: 'transport_type', title: '运输方式', dataIndex: 'transport_type', width: 90,
+      render: (t) => dictLabel(TRANSPORT_TYPE_MAP, t) },
     { key: 'tracking_status_col', title: '轨迹状态', width: 90,
       render: (_, r) => {
         const trackNo = r.bl_no_overseas || r.bl_no_domestic || r.carrier_jobno || r.so_no || '';
@@ -450,82 +636,70 @@ function Yunwuyun() {
         }
         return <Tag color="default" icon={<ClockCircleFilled />}>未抓取</Tag>;
       }},
-    { key: 'etd', title: 'ETD', dataIndex: 'etd', width: 110,
-      render: (t) => t ? dayjs(t).format('YYYY-MM-DD') : '-' },
-    { key: 'eta', title: 'ETA', dataIndex: 'eta', width: 110,
-      render: (t) => t ? dayjs(t).format('YYYY-MM-DD') : '-' },
-    { key: 'cnt_nos', title: '柜号', dataIndex: 'cnt_nos', width: 120, ellipsis: true,
-      render: (t) => t || '-' },
-    { key: 'goods_name', title: '品名', dataIndex: 'goods_name', width: 120, ellipsis: true,
-      render: (t) => t || '-' },
-    { key: 'pieces', title: '件数', dataIndex: 'pieces', width: 80, align: 'right',
-      render: (v) => v != null ? v : '-' },
-    { key: 'goods_cbm', title: '体积(CBM)', dataIndex: 'goods_cbm', width: 100, align: 'right',
-      render: (v) => v != null ? v.toFixed(3) : '-' },
-    { key: 'gross_kgs', title: '毛重(KGS)', dataIndex: 'gross_kgs', width: 100, align: 'right',
-      render: (v) => v != null ? v.toFixed(3) : '-' },
-    { key: 'ar_amt', title: '应收(AR)', dataIndex: 'ar_amt', width: 110, align: 'right',
-      render: (v) => <Text style={{ color: v > 0 ? '#1677ff' : '#999' }}>{formatMoney(v)}</Text> },
-    { key: 'ap_amt', title: '应付(AP)', dataIndex: 'ap_amt', width: 110, align: 'right',
-      render: (v) => <Text style={{ color: v > 0 ? '#ff4d4f' : '#999' }}>{formatMoney(v)}</Text> },
-    { key: 'gr_oss', title: '毛利', dataIndex: 'gr_oss', width: 110, align: 'right',
-      render: (v) => {
-        const color = v > 0 ? '#52c41a' : v < 0 ? '#ff4d4f' : '#999';
-        return <Text style={{ color }}>{formatMoney(v)}</Text>;
-      }},
     { key: 'order_status', title: '订单状态', dataIndex: 'order_status', width: 90,
       render: (v) => {
         const info = ORDER_STATUS_MAP[v] || { text: v, color: 'default' };
         return <Tag color={info.color}>{info.text}</Tag>;
       }},
-    { key: 'close_status', title: '关闭状态', dataIndex: 'close_status', width: 80,
+    { key: 'close_status', title: '关闭状态', dataIndex: 'close_status', width: 85,
       render: (v) => {
         const info = CLOSE_STATUS_MAP[v] || { text: v, color: 'default' };
         return <Tag color={info.color}>{info.text}</Tag>;
       }},
+    { key: 'goods_name', title: '品名', dataIndex: 'goods_name', width: 120, ellipsis: true,
+      render: (t) => t || '-' },
+    { key: 'pieces', title: '件数', dataIndex: 'pieces', width: 80, align: 'right',
+      render: (v) => (v != null ? v : '-') },
+    { key: 'goods_cbm', title: '体积(CBM)', dataIndex: 'goods_cbm', width: 100, align: 'right',
+      render: (v) => (v != null ? v.toFixed(3) : '-') },
+    { key: 'gross_kgs', title: '毛重(KGS)', dataIndex: 'gross_kgs', width: 100, align: 'right',
+      render: (v) => (v != null ? v.toFixed(3) : '-') },
     { key: 'bl_no_domestic', title: '国内提单号', dataIndex: 'bl_no_domestic', width: 130,
       render: (t) => t || '-' },
     { key: 'delivery_country', title: '送货国家', dataIndex: 'delivery_country', width: 100,
       render: (t) => t || '-' },
     { key: 'dest_country', title: '目的国家', dataIndex: 'dest_country', width: 100,
       render: (t) => t || '-' },
-    { key: 'inserted_by', title: '创建人', dataIndex: 'inserted_by', width: 100 },
-    { key: 'job_date', title: '创建日期', dataIndex: 'job_date', width: 110,
-      render: (t) => t ? dayjs(t).format('YYYY-MM-DD') : '-' },
-    { key: 'action', title: '操作', width: 320, fixed: 'right',
+    { key: 'action', title: '操作', width: 190, fixed: 'right',
       render: (_, r) => {
         // 选择轨迹查询单号：海外提单号 > 国内提单号 > 船东单号 > 订舱号
         const trackNo = r.bl_no_overseas || r.bl_no_domestic || r.carrier_jobno || r.so_no || '';
         const hasTracking = r.has_tracking === 1;
         return (
-        <Space size="small">
-          {trackNo && (
-            <Tooltip title={hasTracking ? '重新抓取轨迹数据' : '抓取轨迹并存储到数据库'}>
-              <Button type="link" size="small" icon={<SyncOutlined />}
-                loading={fetchingJobId === r.job_id}
-                style={hasTracking ? { color: '#52c41a' } : {}}
-                onClick={() => handleFetchTracking(r.job_id)}>{hasTracking ? '重抓' : '抓轨迹'}</Button>
-            </Tooltip>
-          )}
-          {trackNo && hasTracking && (
-            <Tooltip title="查看已抓取的轨迹数据">
-              <Button type="link" size="small" icon={<EnvironmentOutlined />}
-                onClick={() => handleViewTracking(r.job_id)}>查看轨迹</Button>
-            </Tooltip>
-          )}
-          <Button type="link" size="small" icon={<EyeOutlined />}
-            onClick={() => handleViewDetail('order', r.job_id)}>详情</Button>
-          <Button type="link" size="small" icon={<EditOutlined />}
-            onClick={() => handleOpenEdit('order', r)}>编辑</Button>
-          <Popconfirm title="确认删除此订单？" onConfirm={() => handleDelete('order', r.job_id)}>
-            <Button type="link" size="small" danger icon={<DeleteOutlined />}>删除</Button>
-          </Popconfirm>
-        </Space>
-      );},
+          <Space size={4}>
+            {trackNo && (
+              <Tooltip title={hasTracking ? '重新抓取轨迹数据' : '抓取轨迹并存储到数据库'}>
+                <Button type="link" size="small" icon={<SyncOutlined />}
+                  loading={fetchingJobId === r.job_id}
+                  style={hasTracking ? { color: '#52c41a' } : {}}
+                  onClick={() => handleFetchTracking(r.job_id)}>{hasTracking ? '重抓' : '抓轨迹'}</Button>
+              </Tooltip>
+            )}
+            {trackNo && hasTracking && (
+              <Tooltip title="查看已抓取的轨迹数据">
+                <Button type="link" size="small" icon={<EnvironmentOutlined />}
+                  onClick={() => handleViewTracking(r.job_id)}>轨迹</Button>
+              </Tooltip>
+            )}
+            <Button type="link" size="small" icon={<EyeOutlined />}
+              onClick={() => handleViewDetail('order', r.job_id)}>详情</Button>
+            <Button type="link" size="small" icon={<EditOutlined />}
+              onClick={() => handleOpenEdit('order', r)}>编辑</Button>
+            <Popconfirm title="确认删除此订单？" onConfirm={() => handleDelete('order', r.job_id)}>
+              <Button type="link" size="small" danger icon={<DeleteOutlined />} />
+            </Popconfirm>
+          </Space>
+        );
+      },
     },
   ];
 
-  const DEFAULT_ORDER_COL_KEYS = ALL_ORDER_COLUMNS.map(c => c.key);
+  // 默认展示 FMS 运物云订单列表主视图列，其余列在「列设置」里按需打开
+  const DEFAULT_ORDER_COL_KEYS = [
+    'job_no', 'job_date', 'so_no', 'client_name', 'carrier_name', 'vessel_voyage',
+    'etd', 'eta', 'dest_country', 'bl_no_domestic', 'goods_name', 'pieces', 'goods_cbm', 'gross_kgs',
+    'ar_amt', 'ap_amt', 'gr_oss', 'paid_amt', 'unpaid_amt', 'order_status', 'action',
+  ];
 
   const orderColumns = (() => {
     const keys = orderVisibleCols || DEFAULT_ORDER_COL_KEYS;
@@ -535,7 +709,7 @@ function Yunwuyun() {
 
   const saveOrderCols = (keys) => {
     setOrderVisibleCols(keys);
-    localStorage.setItem('yunwuyun_order_cols', JSON.stringify(keys));
+    localStorage.setItem('yunwuyun_order_cols_v3', JSON.stringify(keys));
   };
 
   const moveCol = (from, to) => {
@@ -633,6 +807,24 @@ function Yunwuyun() {
 
   return (
     <div style={{ padding: 24 }}>
+      <style>{`
+        .yunwuyun-table .ant-table-thead > tr > th {
+          background: #f5f7fa !important;
+          color: #1f2329 !important;
+          font-weight: 600 !important;
+          font-size: 12px !important;
+          padding: 8px 10px !important;
+          white-space: nowrap;
+        }
+        .yunwuyun-table .ant-table-tbody > tr > td {
+          padding: 7px 10px !important;
+          font-size: 12px !important;
+        }
+        .yunwuyun-table .ant-table-tbody > tr.yunwuyun-row-closed > td {
+          color: #a6a6a6 !important;
+          background: #fafafa !important;
+        }
+      `}</style>
       <Row justify="space-between" align="middle" style={{ marginBottom: 16 }}>
         <Col>
           <Title level={4} style={{ margin: 0 }}>FMS数据同步</Title>
@@ -669,36 +861,54 @@ function Yunwuyun() {
         </Col>
       </Row>
 
-      <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
-        <Col xs={12} sm={6}>
-          <Card size="small">
-            <Statistic title="订单总数" value={stats.orderCount} prefix={<FileTextOutlined />} />
+      <Row gutter={[12, 12]} style={{ marginBottom: 16 }}>
+        <Col xs={12} sm={8} lg={4}>
+          <Card size="small" bodyStyle={{ padding: '12px 16px' }}>
+            <Statistic title="订单总数" value={stats.orderCount} valueStyle={{ fontSize: 20 }} />
           </Card>
         </Col>
-        <Col xs={12} sm={6}>
-          <Card size="small">
-            <Statistic title="客户总数" value={stats.customerCount} prefix={<TeamOutlined />} />
+        <Col xs={12} sm={8} lg={4}>
+          <Card size="small" bodyStyle={{ padding: '12px 16px' }}>
+            <Statistic title="客户总数" value={stats.customerCount} valueStyle={{ fontSize: 20 }} />
           </Card>
         </Col>
-        <Col xs={12} sm={6}>
-          <Card size="small">
+        <Col xs={12} sm={8} lg={4}>
+          <Card size="small" bodyStyle={{ padding: '12px 16px' }}>
             <Statistic
-              title="应收合计(AR)"
+              title="应收合计"
               value={stats.totalAR}
               precision={2}
-              prefix={<DollarOutlined />}
-              valueStyle={{ color: '#1677ff' }}
+              valueStyle={{ fontSize: 20, color: '#1677ff' }}
             />
           </Card>
         </Col>
-        <Col xs={12} sm={6}>
-          <Card size="small">
+        <Col xs={12} sm={8} lg={4}>
+          <Card size="small" bodyStyle={{ padding: '12px 16px' }}>
+            <Statistic
+              title="已收合计"
+              value={stats.totalPaid}
+              precision={2}
+              valueStyle={{ fontSize: 20, color: '#52c41a' }}
+            />
+          </Card>
+        </Col>
+        <Col xs={12} sm={8} lg={4}>
+          <Card size="small" bodyStyle={{ padding: '12px 16px' }}>
+            <Statistic
+              title="未收合计"
+              value={stats.totalUnpaid}
+              precision={2}
+              valueStyle={{ fontSize: 20, color: '#fa8c16' }}
+            />
+          </Card>
+        </Col>
+        <Col xs={12} sm={8} lg={4}>
+          <Card size="small" bodyStyle={{ padding: '12px 16px' }}>
             <Statistic
               title="毛利合计"
               value={stats.totalProfit}
               precision={2}
-              prefix={<TrophyOutlined />}
-              valueStyle={{ color: stats.totalProfit >= 0 ? '#52c41a' : '#ff4d4f' }}
+              valueStyle={{ fontSize: 20, color: stats.totalProfit >= 0 ? '#52c41a' : '#ff4d4f' }}
             />
           </Card>
         </Col>
@@ -794,18 +1004,46 @@ function Yunwuyun() {
                   </Col>
                 </Row>
                 <Table
+                  className="yunwuyun-table"
                   columns={orderColumns}
                   dataSource={orders}
                   rowKey="job_id"
                   loading={orderLoading}
-                  scroll={{ x: 3200 }}
+                  size="small"
+                  bordered
+                  scroll={{ x: 2500 }}
+                  rowClassName={(r) => (r.close_status === 20 ? 'yunwuyun-row-closed' : '')}
+                  summary={() => (
+                    <Table.Summary.Row>
+                      {orderColumns.map((col, idx) => {
+                        const s = orderSummary || {};
+                        let content = null;
+                        if (col.key === 'job_no') content = '合计';
+                        else if (col.key === 'ar_amt') content = formatMoney(s.ar_amt_cy);
+                        else if (col.key === 'ap_amt') content = formatMoney(s.ap_amt_cy);
+                        else if (col.key === 'gr_oss') content = formatMoney(s.gr_oss);
+                        else if (col.key === 'paid_amt') content = formatMoney(s.paid_amt);
+                        else if (col.key === 'unpaid_amt') content = formatMoney(s.unpaid_amt);
+                        return (
+                          <Table.Summary.Cell key={col.key} index={idx} align={col.align}>
+                            {content !== null ? <Text strong>{content}</Text> : null}
+                          </Table.Summary.Cell>
+                        );
+                      })}
+                    </Table.Summary.Row>
+                  )}
                   pagination={{
                     current: orderParams.page,
                     pageSize: orderParams.pageSize,
                     total: orderTotal,
                     showSizeChanger: true,
+                    pageSizeOptions: ['20', '50', '100', '200'],
                     showTotal: (t) => `共 ${t} 条`,
-                    onChange: (p, s) => setOrderParams((prev) => ({ ...prev, page: p, pageSize: s })),
+                    onChange: (p, s) => setOrderParams((prev) => ({
+                      ...prev,
+                      page: s !== prev.pageSize ? 1 : p,
+                      pageSize: s,
+                    })),
                   }}
                 />
               </div>
@@ -852,10 +1090,13 @@ function Yunwuyun() {
                   </Col>
                 </Row>
                 <Table
+                  className="yunwuyun-table"
                   columns={customerColumns}
                   dataSource={customers}
                   rowKey="client_id"
                   loading={custLoading}
+                  size="small"
+                  bordered
                   scroll={{ x: 1800 }}
                   rowSelection={{
                     selectedRowKeys,
@@ -964,19 +1205,32 @@ function Yunwuyun() {
             <Divider>财务信息</Divider>
             <Descriptions column={3} size="small" bordered>
               <Descriptions.Item label="应收(AR)">
-                <Text style={{ color: detailData.ar_amt > 0 ? '#1677ff' : '#999' }}>
-                  {formatMoney(detailData.ar_amt)}
+                <Text style={{ color: detailData.ar_amt_cy > 0 ? '#1677ff' : '#999' }}>
+                  {formatMoney(detailData.ar_amt_cy)}
                 </Text>
               </Descriptions.Item>
               <Descriptions.Item label="应付(AP)">
-                <Text style={{ color: detailData.ap_amt > 0 ? '#ff4d4f' : '#999' }}>
-                  {formatMoney(detailData.ap_amt)}
+                <Text style={{ color: detailData.ap_amt_cy > 0 ? '#ff4d4f' : '#999' }}>
+                  {formatMoney(detailData.ap_amt_cy)}
                 </Text>
               </Descriptions.Item>
               <Descriptions.Item label="毛利">
-                <Text style={{ color: detailData.gr_oss > 0 ? '#52c41a' : detailData.gr_oss < 0 ? '#ff4d4f' : '#999' }}>
-                  {formatMoney(detailData.gr_oss)}
+                <Text style={{ color: (detailData.ar_amt_cy - detailData.ap_amt_cy) > 0 ? '#52c41a' : (detailData.ar_amt_cy - detailData.ap_amt_cy) < 0 ? '#ff4d4f' : '#999' }}>
+                  {formatMoney(detailData.ar_amt_cy - detailData.ap_amt_cy)}
                 </Text>
+              </Descriptions.Item>
+              <Descriptions.Item label="已收">
+                <Text style={{ color: detailData.ar_settled_amt > 0 ? '#52c41a' : '#999' }}>
+                  {formatMoney(detailData.ar_settled_amt)}
+                </Text>
+              </Descriptions.Item>
+              <Descriptions.Item label="未收">
+                <Text style={{ color: detailData.ar_unsettled_amt > 0 ? '#fa8c16' : '#52c41a' }}>
+                  {detailData.ar_unsettled_amt > 0 ? formatMoney(detailData.ar_unsettled_amt) : '已结清'}
+                </Text>
+              </Descriptions.Item>
+              <Descriptions.Item label="核销同步时间">
+                {detailData.settled_at ? formatDate(detailData.settled_at) : '-'}
               </Descriptions.Item>
               <Descriptions.Item label="AR数">{detailData.ar_count ?? 0}</Descriptions.Item>
               <Descriptions.Item label="AP数">{detailData.ap_count ?? 0}</Descriptions.Item>
@@ -997,6 +1251,7 @@ function Yunwuyun() {
         )}
 
         {detailData && detailType === 'customer' && (
+          <>
           <Descriptions column={2} size="small" bordered>
             <Descriptions.Item label="客户编码" span={2}>
               <Text strong>{detailData.client_code}</Text>
@@ -1038,8 +1293,157 @@ function Yunwuyun() {
             <Descriptions.Item label="更新人">{detailData.updated_by || '-'}</Descriptions.Item>
             <Descriptions.Item label="最后同步" span={2}>{formatDate(detailData.synced_at)}</Descriptions.Item>
           </Descriptions>
+
+          <Divider>回款情况</Divider>
+          <Spin spinning={paymentLoading}>
+            <Row gutter={12} style={{ marginBottom: 16 }}>
+              <Col span={8}>
+                <Card size="small" bodyStyle={{ padding: '10px 14px' }}>
+                  <Statistic
+                    title="应收合计"
+                    value={paymentSummary?.totalAR || 0}
+                    precision={2}
+                    valueStyle={{ fontSize: 18, color: '#1677ff' }}
+                  />
+                </Card>
+              </Col>
+              <Col span={8}>
+                <Card size="small" bodyStyle={{ padding: '10px 14px' }}>
+                  <Statistic
+                    title="已付金额"
+                    value={paymentSummary?.totalPaid || 0}
+                    precision={2}
+                    valueStyle={{ fontSize: 18, color: '#52c41a' }}
+                  />
+                </Card>
+              </Col>
+              <Col span={8}>
+                <Card size="small" bodyStyle={{ padding: '10px 14px' }}>
+                  <Statistic
+                    title="待收余额"
+                    value={paymentSummary?.totalUnpaid || 0}
+                    precision={2}
+                    valueStyle={{ fontSize: 18, color: (paymentSummary?.totalUnpaid || 0) > 0 ? '#fa8c16' : '#52c41a' }}
+                  />
+                </Card>
+              </Col>
+            </Row>
+
+            <Row justify="space-between" align="middle" style={{ marginBottom: 8 }}>
+              <Col><Text type="secondary" style={{ fontSize: 12 }}>回款流水（共 {payments.length} 笔）</Text></Col>
+              <Col>
+                <Button type="primary" size="small" icon={<PlusOutlined />}
+                  onClick={() => handleOpenPayment(null)}>登记回款</Button>
+              </Col>
+            </Row>
+            <Table
+              className="yunwuyun-table"
+              size="small"
+              bordered
+              rowKey="id"
+              dataSource={payments}
+              pagination={false}
+              locale={{ emptyText: '暂无回款记录' }}
+              columns={[
+                { title: '回款日期', dataIndex: 'paid_at', width: 110,
+                  render: (t) => (t ? dayjs(t).format('YYYY-MM-DD') : '-') },
+                { title: '关联工作号', dataIndex: 'job_no', width: 130,
+                  render: (t) => t || <Text type="secondary">客户级</Text> },
+                { title: '回款金额', dataIndex: 'amount', width: 120, align: 'right',
+                  render: (v) => <Text style={{ color: '#52c41a' }}>{formatMoney(v)}</Text> },
+                { title: '币种', dataIndex: 'currency', width: 70, render: (t) => t || 'CNY' },
+                { title: '备注', dataIndex: 'remark', ellipsis: true, render: (t) => t || '-' },
+                { title: '操作', width: 110, render: (_, r) => (
+                  <Space size={0}>
+                    <Button type="link" size="small" onClick={() => handleOpenPayment(r)}>编辑</Button>
+                    <Popconfirm title="确认删除此回款记录？" onConfirm={() => handleDeletePayment(r.id)}>
+                      <Button type="link" size="small" danger>删除</Button>
+                    </Popconfirm>
+                  </Space>
+                )},
+              ]}
+            />
+
+            <Row justify="space-between" align="middle" style={{ margin: '16px 0 8px' }}>
+              <Col><Text type="secondary" style={{ fontSize: 12 }}>
+                订单未收明细（不含已关闭订单，共 {paymentSummary?.orders?.length || 0} 单）
+              </Text></Col>
+            </Row>
+            <Table
+              className="yunwuyun-table"
+              size="small"
+              bordered
+              rowKey="job_id"
+              dataSource={paymentSummary?.orders || []}
+              pagination={false}
+              scroll={{ y: 240 }}
+              locale={{ emptyText: '暂无订单' }}
+              columns={[
+                { title: '工作号', dataIndex: 'job_no', width: 130 },
+                { title: '工作单日期', dataIndex: 'job_date', width: 110,
+                  render: (t) => (t ? dayjs(t).format('YYYY-MM-DD') : '-') },
+                { title: '应收', dataIndex: 'ar_amt_cy', width: 110, align: 'right',
+                  render: (v) => <Text style={{ color: '#1677ff' }}>{formatMoney(v)}</Text> },
+                { title: '已收', dataIndex: 'paid_amt', width: 110, align: 'right',
+                  render: (v) => <Text style={{ color: '#52c41a' }}>{formatMoney(v)}</Text> },
+                { title: '未收', dataIndex: 'unpaid_amt', width: 110, align: 'right',
+                  render: (v) => (
+                    <Text style={{ color: v > 0 ? '#fa8c16' : '#52c41a' }}>
+                      {v > 0 ? formatMoney(v) : '已结清'}
+                    </Text>
+                  )},
+              ]}
+            />
+          </Spin>
+          </>
         )}
       </Drawer>
+
+      {/* 回款登记弹窗 */}
+      <Modal
+        title={paymentModal.record ? '编辑回款' : '登记回款'}
+        open={paymentModal.visible}
+        onCancel={() => { setPaymentModal({ visible: false, record: null }); paymentForm.resetFields(); }}
+        onOk={handleSavePayment}
+        width={480}
+        destroyOnHidden
+      >
+        <Form form={paymentForm} layout="vertical" style={{ marginTop: 12 }}>
+          <Form.Item name="job_id" label="关联工作号（可选，留空则记为客户级回款）">
+            <Select
+              allowClear
+              showSearch
+              placeholder="选择订单"
+              optionFilterProp="label"
+              options={(paymentSummary?.orders || []).map((o) => ({
+                value: o.job_id,
+                label: `${o.job_no}（${o.unpaid_amt > 0 ? `未收 ${formatMoney(o.unpaid_amt)}` : '已结清'}）`,
+              }))}
+            />
+          </Form.Item>
+          <Row gutter={12}>
+            <Col span={14}>
+              <Form.Item name="amount" label="回款金额" rules={[{ required: true, message: '请输入回款金额' }]}>
+                <InputNumber style={{ width: '100%' }} min={0.01} precision={2} placeholder="0.00" />
+              </Form.Item>
+            </Col>
+            <Col span={10}>
+              <Form.Item name="currency" label="币种">
+                <Select options={[
+                  { value: 'CNY', label: 'CNY 人民币' },
+                  { value: 'USD', label: 'USD 美元' },
+                ]} />
+              </Form.Item>
+            </Col>
+          </Row>
+          <Form.Item name="paid_at" label="回款日期">
+            <DatePicker style={{ width: '100%' }} />
+          </Form.Item>
+          <Form.Item name="remark" label="备注">
+            <TextArea rows={2} placeholder="如：银行流水号 / 付款方" />
+          </Form.Item>
+        </Form>
+      </Modal>
 
       {/* 编辑/新增弹窗 */}
       <Modal

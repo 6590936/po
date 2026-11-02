@@ -24,9 +24,14 @@ async function request(url, options = {}) {
     });
 
     if (response.status === 401 || response.status === 403) {
-      useAuthStore.getState().logout();
-      window.location.href = '/login';
-      throw new Error('认证失败，请重新登录');
+      const data = await response.json().catch(() => ({}));
+      const msg = data.error || data.message || '';
+      const authFailed = response.status === 401 || /登录已过期|请先登录|无效的客户端凭证/.test(msg);
+      if (authFailed && token) {
+        useAuthStore.getState().logout();
+        window.location.href = '/login';
+      }
+      throw new Error(msg || (authFailed ? '认证失败，请重新登录' : '无权限访问'));
     }
 
     const data = await response.json();
@@ -179,6 +184,17 @@ export const yunwuyunAPI = {
   deleteCustomer: (id) => request(`/yunwuyun/customers/${id}`, { method: 'DELETE' }),
 
   getStats: () => request('/yunwuyun/stats'),
+
+  // 客户回款
+  getPayments: (params = {}) => {
+    const query = new URLSearchParams(params).toString();
+    return request(`/yunwuyun/payments?${query}`);
+  },
+  getPaymentSummary: (client_id) => request(`/yunwuyun/payments/summary?client_id=${client_id}`),
+  createPayment: (data) => request('/yunwuyun/payments', { method: 'POST', body: JSON.stringify(data) }),
+  updatePayment: (id, data) => request(`/yunwuyun/payments/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  deletePayment: (id) => request(`/yunwuyun/payments/${id}`, { method: 'DELETE' }),
+
   syncOrders: () => request('/yunwuyun/sync-orders', { method: 'POST' }),
   syncCustomers: () => request('/yunwuyun/sync-customers', { method: 'POST' }),
   setToken: (token) => request('/yunwuyun/set-token', { method: 'POST', body: JSON.stringify({ token }) }),

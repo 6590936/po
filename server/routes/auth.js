@@ -1,8 +1,10 @@
 // 认证路由
 import express from 'express';
 import jwt from 'jsonwebtoken';
+import bcrypt from 'bcryptjs';
 import { UserOps, RoleOps, TenantOps, getDb } from '../database.js';
 import { logAudit } from '../logger.js';
+import { signClientToken, toClientProfile } from './client.js';
 
 const router = express.Router();
 const JWT_SECRET = process.env.JWT_SECRET || 'meiou-crm-secret-key-2024';
@@ -10,6 +12,39 @@ const TOKEN_EXPIRY = '7d';
 
 function hasPerm(perms, key) { return (perms || []).includes(key); }
 function isPlatform(req) { return !req.user.tenant_id && hasPerm(req.user.permissions, 'system:platform'); }
+
+// 员工会话签发（登录与统一登录共用）
+function issueStaffSession(user) {
+  let permissions = RoleOps.getUserPermissions(user.role_id);
+  let menus = RoleOps.getUserMenus(user.role_id);
+
+  if (!menus.length && user.role === 'admin') {
+    permissions = ['data:all', 'system:platform', 'shipping:active', 'shipping:batches', 'shipping:detail'];
+    menus = ['/', '/customers', '/shipping-rates', '/fee-templates', '/wechat', '/sales', '/admin'];
+  }
+
+  const token = jwt.sign(
+    {
+      id: user.id, username: user.username, name: user.name,
+      role: user.role, role_id: user.role_id,
+      tenant_id: user.tenant_id, tenant_name: user.tenant_name,
+      permissions,
+    },
+    JWT_SECRET,
+    { expiresIn: TOKEN_EXPIRY }
+  );
+
+  return {
+    token,
+    user: {
+      id: user.id, username: user.username, name: user.name, role: user.role,
+      role_id: user.role_id,
+      tenant_id: user.tenant_id, tenant_name: user.tenant_name,
+      menus,
+      permissions,
+    },
+  };
+}
 
 // 登录
 router.post('/login', (req, res) => {
@@ -32,25 +67,6 @@ router.post('/login', (req, res) => {
     return res.status(403).json({ error: '账号已停用，请联系管理员' });
   }
 
-  let permissions = RoleOps.getUserPermissions(user.role_id);
-  let menus = RoleOps.getUserMenus(user.role_id);
-
-  if (!menus.length && user.role === 'admin') {
-    permissions = ['data:all', 'system:platform', 'shipping:active', 'shipping:batches', 'shipping:detail'];
-    menus = ['/', '/customers', '/shipping-rates', '/fee-templates', '/wechat', '/sales', '/admin'];
-  }
-
-  const token = jwt.sign(
-    {
-      id: user.id, username: user.username, name: user.name,
-      role: user.role, role_id: user.role_id,
-      tenant_id: user.tenant_id, tenant_name: user.tenant_name,
-      permissions,
-    },
-    JWT_SECRET,
-    { expiresIn: TOKEN_EXPIRY }
-  );
-
   logAudit({
     user_id: user.id,
     username: user.username,
@@ -60,15 +76,73 @@ router.post('/login', (req, res) => {
     ip_address: req.ip || req.connection?.remoteAddress || null,
   });
 
-  res.json({
-    token,
-    user: {
-      id: user.id, username: user.username, name: user.name, role: user.role,
-      role_id: user.role_id,
-      tenant_id: user.tenant_id, tenant_name: user.tenant_name,
-      menus,
-      permissions,
-    },
+  res.json(issueStaffSession(user));
+});
+
+// 统一登录：先按员工账号校验，找不到再按客户账号校验
+router.post('/unified-login', (req, res) => {
+  const { account, password } = req.body;
+  if (!account || !password) {
+    return res.status(400).json({ error: '请输入账号和密码' });
+  }
+
+  const db = getDb();
+  const ip = req.ip || req.connection?.remoteAddress || null;
+
+  // 员工账号存在时只走员工校验，避免与客户账号混淆
+  const staffExists = db.prepare('SELECT id FROM users WHERE username = ?').get(account);
+  if (staffExists) {
+    const user = UserOps.findByCredentials(account, password);
+    if (!user) {
+      return res.status(401).json({ error: '账号或密码错误' });
+    }
+    if (user.tenant_status === 'inactive') {
+      return res.status(403).json({ error: '所属公司已被停用，无法登录' });
+    }
+    if (user.status !== 'active') {
+      return res.status(403).json({ error: '账号已停用，请联系管理员' });
+    }
+
+    logAudit({
+      user_id: user.id,
+      username: user.username,
+      action: 'LOGIN',
+      target_type: 'user',
+      target_id: user.id,
+      ip_address: ip,
+    });
+
+    return res.json({ type: 'staff', ...issueStaffSession(user) });
+  }
+
+  // 客户账号校验（与客户门户登录规则一致）
+  const customer = db.prepare(
+    'SELECT * FROM yunwuyun_customers WHERE login_account = ? OR (login_account IS NULL AND client_code = ?)'
+  ).get(account, account);
+
+  if (!customer) {
+    return res.status(401).json({ error: '账号不存在，请检查账号是否正确' });
+  }
+  if (!customer.login_enabled) {
+    return res.status(403).json({ error: '该账号尚未开通登录，请联系客服' });
+  }
+  if (!customer.login_password || !bcrypt.compareSync(password, customer.login_password)) {
+    return res.status(401).json({ error: '密码错误' });
+  }
+
+  logAudit({
+    user_id: customer.client_id,
+    username: account,
+    action: 'CLIENT_LOGIN',
+    target_type: 'client',
+    target_id: customer.client_id,
+    ip_address: ip,
+  });
+
+  return res.json({
+    type: 'client',
+    token: signClientToken(customer),
+    client: toClientProfile(customer),
   });
 });
 
@@ -363,7 +437,11 @@ export function authenticateToken(req, res, next) {
   const token = authHeader && authHeader.split(' ')[1];
   if (!token) return res.status(401).json({ error: '请先登录' });
   try {
-    req.user = jwt.verify(token, JWT_SECRET);
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (decoded.type === 'client') {
+      return res.status(403).json({ error: '客户端凭证不能访问内部接口' });
+    }
+    req.user = decoded;
     next();
   } catch (err) {
     return res.status(403).json({ error: '登录已过期，请重新登录' });

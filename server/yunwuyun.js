@@ -1,12 +1,17 @@
 // 云无云 FMS 系统对接模块
 import https from 'https';
 import querystring from 'querystring';
+import crypto from 'crypto';
 
 const BASE_URL = 'https://fms.yunwuyun.com';
 const TENANT_CODE = 'MOGJ';
+const FMS_USERCODE = process.env.FMS_USERCODE || 'admin';
+const FMS_PASSWORD = process.env.FMS_PASSWORD || '6590936a';
 
 let cachedToken = 'eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJlYXN5ZnJlaWdodC1zcnYtdXNlciIsImlhdCI6MTc4Njg3MDE5NiwiZXhwIjoxNzg2OTEzMzk2LCJ0ZW5hbnRJZCI6NTc4MzA0NzAwOSwic3RhZmZJZCI6MTgxNTc3ODg4NzAwOCwidXNlckNvZGUiOiJhZG1pbiIsInJvd29yZ2lkIjoxODE1Nzc4ODc5MDA4LCJ1c2VyVHlwZSI6MTAsInByb2R1Y3RJZCI6MjI2MTIzMDAwOSwidmlydHVhbFN0YXR1cyI6MTB9.YU47cCMgPo9IWKcjy-AqIb-Wkd7bT-Iik0a2qf0BQKs';
 let cachedJSESSIONID = 'B0E0EE73D36E372BE6322232D7E6ACB0';
+let defaultHeadersUserId = '1815778887008';
+let defaultHeadersRowOrgId = '1815778879008';
 // 解析JWT真实过期时间，避免用过期token请求
 let tokenExpiry = (() => {
   try {
@@ -29,8 +34,8 @@ function request(method, path, { body, params, headers = {} } = {}) {
       'Accept': 'application/json, text/plain, */*',
       'devicetype': 'PC',
       'txlang': 'zh-CN',
-      'userid': '1815778887008',
-      'roworgid': '1815778879008',
+      'userid': defaultHeadersUserId,
+      'roworgid': defaultHeadersRowOrgId,
       ...headers,
     };
 
@@ -66,7 +71,7 @@ function request(method, path, { body, params, headers = {} } = {}) {
           }
         }
         // 日志：非查询接口打印响应
-        if (!path.includes('queryFbxOrderList')) {
+        if (!path.includes('queryFbxOrderList') && !path.includes('queryOrderCompositeList')) {
           const preview = typeof data === 'string' ? data.slice(0, 200) : JSON.stringify(data).slice(0, 200);
           console.log(`[云无云] ${method} ${path} → HTTP ${res.statusCode}`, preview);
         }
@@ -97,33 +102,59 @@ function request(method, path, { body, params, headers = {} } = {}) {
   });
 }
 
-async function login(username = 'admin', password = 'MO1234') {
+function randomString(len) {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let out = '';
+  for (let i = 0; i < len; i++) out += chars[Math.floor(Math.random() * chars.length)];
+  return out;
+}
+
+function encryptPassword(plain, key, iv) {
+  const cipher = crypto.createCipheriv('aes-128-cbc', Buffer.from(key, 'utf8'), Buffer.from(iv, 'utf8'));
+  return Buffer.concat([cipher.update(plain, 'utf8'), cipher.final()]).toString('base64');
+}
+
+async function login(username = FMS_USERCODE, password = FMS_PASSWORD) {
   console.log('[云无云] 正在登录...');
-  // 登录时清掉所有旧会话信息，也不带 userid/roworgid
   const oldToken = cachedToken;
   const oldSession = cachedJSESSIONID;
   cachedToken = null;
   cachedJSESSIONID = null;
-  const body = querystring.stringify({ username, password, tenantCode: TENANT_CODE });
-  const result = await request('POST', '/api/getToken', {
-    body,
-    headers: { 'userid': undefined, 'roworgid': undefined },
+
+  const key = randomString(16);
+  const iv = randomString(16);
+  const result = await request('POST', '/api/ucm/user/login', {
+    body: {
+      usercode: username,
+      pwdtext: encryptPassword(password, key, iv),
+      captcha: '',
+      checkKey: '',
+      tenantCode: TENANT_CODE,
+      key,
+      iv,
+      fingerprint: '',
+    },
+    headers: { 'Content-Type': 'application/json', 'userid': undefined, 'roworgid': undefined },
   });
-  if (result && result.token) {
-    cachedToken = result.token;
+
+  if (result && result.code === 200 && result.result && result.result.token) {
+    cachedToken = result.result.token;
+    const info = result.result.userInfo || {};
+    if (info.id) defaultHeadersUserId = String(info.id);
+    if (info.roworgid) defaultHeadersRowOrgId = String(info.roworgid);
     try {
-      const payload = JSON.parse(Buffer.from(result.token.split('.')[1], 'base64').toString('utf8'));
+      const payload = JSON.parse(Buffer.from(cachedToken.split('.')[1], 'base64').toString('utf8'));
       tokenExpiry = payload.exp * 1000;
       console.log('[云无云] Token过期时间:', new Date(tokenExpiry).toLocaleString());
     } catch {
       tokenExpiry = Date.now() + 86400000;
     }
     loggedIn = true;
-    console.log('[云无云] 登录成功, token:', result.token.slice(0, 20) + '...');
+    console.log('[云无云] 登录成功, token:', cachedToken.slice(0, 20) + '...');
   } else {
     cachedToken = oldToken;
     cachedJSESSIONID = oldSession;
-    console.log('[云无云] 登录失败:', JSON.stringify(result));
+    console.log('[云无云] 登录失败:', JSON.stringify(result).slice(0, 300));
   }
   return result;
 }
@@ -197,11 +228,85 @@ async function syncOrders(progressCallback) {
     "orderStatusMap", "fmsBizBookingAheads"
   ];
 
+  const dateConditions = [{ field: 'jobDate', value: '2026-01-01,2099-12-31', condition: 'AND' }];
+  const seenJobIds = new Set();
+
+  const mapRecord = (r, now) => ({
+    job_id: r.jobId,
+    job_no: r.jobNo || '',
+    job_type: r.jobType || '',
+    job_date: r.jobDate || '',
+    order_status: r.orderStatus ?? null,
+    close_status: r.closeStatus ?? null,
+    client_id: r.clientId ?? null,
+    client_name: r.clientName || '',
+    client_name_eng: r.clientNameEng || '',
+    client_code: r.clientCode || '',
+    client_abbr: r.clientAbbr || '',
+    carrier_name: r.carrierName || '',
+    vessel: r.vessel || '',
+    voyage: r.voyage || '',
+    etd: r.etd || '',
+    eta: r.eta || '',
+    atd: r.atd || '',
+    so_no: r.soNo || '',
+    bl_no_domestic: r.blNoDomestic || '',
+    bl_no_overseas: r.blNoOverseas || '',
+    carrier_jobno: r.carrierJobno || '',
+    ar_amt: r.arAmt ?? 0,
+    ap_amt: r.apAmt ?? 0,
+    gr_oss: r.grOss ?? 0,
+    freighttons: r.freighttons ?? 0,
+    client_quote_freighttons: r.clientQuoteFreighttons ?? 0,
+    transport_type: r.datacodeTransportType || '',
+    loadtype: r.datacodeLoadtype || '',
+    stow_type: r.stowType ?? null,
+    collect_type: r.collectType ?? null,
+    charging_type: r.chargingType || '',
+    delivery_country: r.deliveryCtryName || '',
+    dest_country: r.portofdestinationCtryName || '',
+    warehouse_code: r.warehouseDeliveryCode || '',
+    supply_channel_code: r.supplyChannelCode || '',
+    supply_channel_name: r.supplyChannelName || '',
+    channel_receive_code: r.channelReceiveCode || '',
+    channel_receive_name: r.channelReceiveName || '',
+    cnt_nos: r.cntNos || '',
+    charging_codes: r.chargingCodes || '',
+    goods_name: r.goodsname || '',
+    goods_value: r.goodsvalue ?? 0,
+    pieces: r.pieces ?? 0,
+    gross_kgs: r.grosskgs ?? 0,
+    goods_cbm: r.goodscbm ?? 0,
+    net_kgs: r.netkgs ?? 0,
+    client_total_volume: r.clientTotalVolume ?? 0,
+    client_total_pieces: r.clientTotalPieces ?? 0,
+    client_total_weight: r.clientTotalWeight ?? 0,
+    client_billing_weight: r.clientBillingWeight ?? 0,
+    box_total_qty: r.boxTotalQty ?? 0,
+    box_total_weight: r.boxTotalWeight ?? 0,
+    box_total_volume: r.boxTotalVolume ?? 0,
+    estimate_quantity_total: r.estimateQuantityTotal ?? 0,
+    goods_cycode: r.goodsCycode || '',
+    base_cy_code: r.baseCyCode || '',
+    order_status_map: JSON.stringify(r.orderStatusMap || {}),
+    booking_aheads: JSON.stringify(r.fmsBizBookingAheads || []),
+    inserted_by: r.insertedBy || '',
+    job_remarks: r.jobRemarks || '',
+    order_change_type: r.orderChangeType ?? null,
+    delivery_fee_cc: r.deliveryFeeCc ?? null,
+    client_settler_type: r.clientSettlerType ?? null,
+    ar_count: r.arCount ?? 0,
+    ap_count: r.apCount ?? 0,
+    latest_problem_count: r.latestProblemCount ?? 0,
+    comment_count: r.commentCount ?? 0,
+    synced_at: now,
+  });
+
   while (true) {
     const body = {
       currentPage,
       total: null,
-      conditionDtos: [],
+      conditionDtos: dateConditions,
       pageSize,
       fields: allFields,
     };
@@ -225,77 +330,9 @@ async function syncOrders(progressCallback) {
       progressCallback({ page: currentPage, synced: totalSynced, total: data.result.total });
     }
 
+    records.forEach(r => seenJobIds.add(r.jobId));
     const now = new Date().toISOString();
-    const mapped = records.map(r => ({
-      job_id: r.jobId,
-      job_no: r.jobNo || '',
-      job_type: r.jobType || '',
-      job_date: r.jobDate || '',
-      order_status: r.orderStatus ?? null,
-      close_status: r.closeStatus ?? null,
-      client_id: r.clientId ?? null,
-      client_name: r.clientName || '',
-      client_name_eng: r.clientNameEng || '',
-      client_code: r.clientCode || '',
-      client_abbr: r.clientAbbr || '',
-      carrier_name: r.carrierName || '',
-      vessel: r.vessel || '',
-      voyage: r.voyage || '',
-      etd: r.etd || '',
-      eta: r.eta || '',
-      atd: r.atd || '',
-      so_no: r.soNo || '',
-      bl_no_domestic: r.blNoDomestic || '',
-      bl_no_overseas: r.blNoOverseas || '',
-      carrier_jobno: r.carrierJobno || '',
-      ar_amt: r.arAmt ?? 0,
-      ap_amt: r.apAmt ?? 0,
-      gr_oss: r.grOss ?? 0,
-      freighttons: r.freighttons ?? 0,
-      client_quote_freighttons: r.clientQuoteFreighttons ?? 0,
-      transport_type: r.datacodeTransportType || '',
-      loadtype: r.datacodeLoadtype || '',
-      stow_type: r.stowType ?? null,
-      collect_type: r.collectType ?? null,
-      charging_type: r.chargingType || '',
-      delivery_country: r.deliveryCtryName || '',
-      dest_country: r.portofdestinationCtryName || '',
-      warehouse_code: r.warehouseDeliveryCode || '',
-      supply_channel_code: r.supplyChannelCode || '',
-      supply_channel_name: r.supplyChannelName || '',
-      channel_receive_code: r.channelReceiveCode || '',
-      channel_receive_name: r.channelReceiveName || '',
-      cnt_nos: r.cntNos || '',
-      charging_codes: r.chargingCodes || '',
-      goods_name: r.goodsname || '',
-      goods_value: r.goodsvalue ?? 0,
-      pieces: r.pieces ?? 0,
-      gross_kgs: r.grosskgs ?? 0,
-      goods_cbm: r.goodscbm ?? 0,
-      net_kgs: r.netkgs ?? 0,
-      client_total_volume: r.clientTotalVolume ?? 0,
-      client_total_pieces: r.clientTotalPieces ?? 0,
-      client_total_weight: r.clientTotalWeight ?? 0,
-      client_billing_weight: r.clientBillingWeight ?? 0,
-      box_total_qty: r.boxTotalQty ?? 0,
-      box_total_weight: r.boxTotalWeight ?? 0,
-      box_total_volume: r.boxTotalVolume ?? 0,
-      estimate_quantity_total: r.estimateQuantityTotal ?? 0,
-      goods_cycode: r.goodsCycode || '',
-      base_cy_code: r.baseCyCode || '',
-      order_status_map: JSON.stringify(r.orderStatusMap || {}),
-      booking_aheads: JSON.stringify(r.fmsBizBookingAheads || []),
-      inserted_by: r.insertedBy || '',
-      job_remarks: r.jobRemarks || '',
-      order_change_type: r.orderChangeType ?? null,
-      delivery_fee_cc: r.deliveryFeeCc ?? null,
-      client_settler_type: r.clientSettlerType ?? null,
-      ar_count: r.arCount ?? 0,
-      ap_count: r.apCount ?? 0,
-      latest_problem_count: r.latestProblemCount ?? 0,
-      comment_count: r.commentCount ?? 0,
-      synced_at: now,
-    }));
+    const mapped = records.map(r => mapRecord(r, now));
 
     allData.push(...mapped);
 
@@ -303,7 +340,96 @@ async function syncOrders(progressCallback) {
     currentPage++;
   }
 
+  let cmpPage = 1;
+  const cmpPageSize = 500;
+  while (true) {
+    const body = {
+      currentPage: cmpPage,
+      total: null,
+      conditionDtos: dateConditions,
+      pageSize: cmpPageSize,
+      fields: allFields,
+    };
+    const data = await request('POST', '/api/fms/fmsseaorder/queryOrderCompositeList', {
+      body: JSON.stringify(body),
+      headers: { 'Content-Type': 'application/json' },
+    });
+
+    console.log(`[云无云] 综合委托单第${cmpPage}页: success=${data?.success}, total=${data?.result?.total}, records=${data?.result?.records?.length || 0}`);
+
+    if (!data?.success) {
+      console.log('[云无云] 综合委托单拉取失败:', JSON.stringify(data).slice(0, 500));
+      break;
+    }
+    if (!data?.result?.records?.length) break;
+
+    const records = data.result.records;
+    const extra = records.filter(r => !seenJobIds.has(r.jobId));
+    if (extra.length) {
+      const now = new Date().toISOString();
+      allData.push(...extra.map(r => mapRecord(r, now)));
+      totalSynced += extra.length;
+      extra.forEach(r => seenJobIds.add(r.jobId));
+    }
+
+    if (cmpPage * cmpPageSize >= (data.result.total || 0)) break;
+    cmpPage++;
+  }
+
   return { success: true, totalSynced, total: totalSynced, data: allData };
+}
+
+// 同步订单应收应付核销（已收/未收、已付/未付）金额
+async function syncOrderSettlements(progressCallback) {
+  await ensureLogin();
+  const pageSize = 500;
+  let currentPage = 1;
+  let fetched = 0;
+  let total = 0;
+  const agg = new Map();
+
+  while (true) {
+    const body = { currentPage, pageSize, total: null, conditionDtos: [] };
+    const data = await request('POST', '/api/report/unirepproject/arapReportSearchListPage', {
+      body: JSON.stringify(body),
+      headers: { 'Content-Type': 'application/json' },
+    });
+
+    if (!data?.success || !data?.result?.records?.length) {
+      if (currentPage === 1) {
+        console.log('[云无云] 核销数据拉取失败:', JSON.stringify(data).slice(0, 300));
+        return { success: false, totalFetched: 0, data: agg };
+      }
+      break;
+    }
+
+    total = data.result.total || total;
+    const records = data.result.records;
+    fetched += records.length;
+
+    for (const r of records) {
+      const jobId = r.orderId;
+      if (!jobId) continue;
+      const cur = agg.get(jobId) || {
+        ar_amt_cy: 0, ar_settled: 0, ar_unsettled: 0,
+        ap_amt_cy: 0, ap_settled: 0, ap_unsettled: 0,
+      };
+      cur.ar_amt_cy += Number(r.baseCurrenAmt) || 0;
+      cur.ar_settled += Number(r.amtSettledToCy) || 0;
+      cur.ar_unsettled += Number(r.amtNoSettledToCy) || 0;
+      cur.ap_amt_cy += Number(r.apBaseAmt) || 0;
+      cur.ap_settled += Number(r.apAmtSettledToCy) || 0;
+      cur.ap_unsettled += Number(r.apAmtNoSettledToCy) || 0;
+      agg.set(jobId, cur);
+    }
+
+    if (progressCallback) progressCallback({ page: currentPage, fetched, total });
+    if (fetched >= total) break;
+    currentPage++;
+  }
+
+  console.log(`[云无云] 核销明细拉取完成: ${fetched} 条, 覆盖订单 ${agg.size} 个`);
+  return { success: true, totalFetched: fetched, data: agg };
 }
 
 // 同步客户数据
@@ -388,4 +514,4 @@ async function syncCustomers(progressCallback) {
   return { success: true, totalSynced, total: totalSynced, data: allData };
 }
 
-export { login, setToken, ensureLogin, queryBizStateType, cntProfitTotal, query, testConnection, syncOrders, syncCustomers };
+export { login, setToken, ensureLogin, queryBizStateType, cntProfitTotal, query, testConnection, syncOrders, syncCustomers, syncOrderSettlements };

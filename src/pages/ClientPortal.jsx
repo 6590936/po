@@ -28,6 +28,7 @@ function ClientPortal() {
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState('');
   const [pagination, setPagination] = useState({ current: 1, pageSize: 20, total: 0 });
+  const [orderSummary, setOrderSummary] = useState(null);
   const [detailVisible, setDetailVisible] = useState(false);
   const [detailOrder, setDetailOrder] = useState(null);
   const [profileSaving, setProfileSaving] = useState(false);
@@ -116,6 +117,7 @@ function ClientPortal() {
       if (data) {
         setOrders(data.data);
         setPagination({ current: data.page, pageSize: data.size, total: data.total });
+        setOrderSummary(data.summary || null);
       }
     } finally {
       setLoading(false);
@@ -127,7 +129,14 @@ function ClientPortal() {
   };
 
   const handleTableChange = (pag) => {
-    fetchOrders(pag.current, pag.pageSize);
+    const sizeChanged = pag.pageSize !== pagination.pageSize;
+    fetchOrders(sizeChanged ? 1 : pag.current, pag.pageSize);
+  };
+
+  const formatMoney = (v) => {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return '-';
+    return n.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   };
 
   const handlePreviewQuotation = async (batchId, itemId) => {
@@ -258,23 +267,32 @@ function ClientPortal() {
     { title: '日期', dataIndex: 'job_date', key: 'job_date', width: 100, render: (v) => v?.slice(0, 10) },
     { title: 'SO号', dataIndex: 'so_no', key: 'so_no', width: 120 },
     { title: '船公司', dataIndex: 'carrier_name', key: 'carrier_name', width: 100 },
-    { title: '船名/航次', key: 'vessel_voyage', width: 150,
-      render: (_, r) => `${r.vessel || '-'} / ${r.voyage || '-'}` },
+    { title: '船名/航次', key: 'vessel_voyage', width: 150, ellipsis: true,
+      render: (_, r) => {
+        const vv = [r.vessel, r.voyage].filter(Boolean).join(' / ');
+        return vv || '-';
+      } },
     { title: 'ETD', dataIndex: 'etd', key: 'etd', width: 100, render: (v) => v?.slice(0, 10) },
     { title: 'ETA', dataIndex: 'eta', key: 'eta', width: 100, render: (v) => v?.slice(0, 10) },
-    { title: '目的国', dataIndex: 'dest_country', key: 'dest_country', width: 100 },
-    { title: '提单号', dataIndex: 'bl_no_domestic', key: 'bl_no_domestic', width: 130 },
     { title: '品名', dataIndex: 'goods_name', key: 'goods_name', width: 150, ellipsis: true },
-    { title: '件数', dataIndex: 'pieces', key: 'pieces', width: 70 },
-    { title: '方数', dataIndex: 'goods_cbm', key: 'goods_cbm', width: 80, render: (v) => v?.toFixed(2) },
-    { title: '毛重', dataIndex: 'gross_kgs', key: 'gross_kgs', width: 80, render: (v) => v?.toFixed(2) },
-    {
-      title: '状态', dataIndex: 'order_status', key: 'order_status', width: 80,
-      render: (v) => {
-        const map = { '已完成': 'green', '进行中': 'blue', '已取消': 'red' };
-        return <Tag color={map[v] || 'default'}>{v || '-'}</Tag>;
-      },
-    },
+    { title: '件数', dataIndex: 'pieces', key: 'pieces', width: 80, align: 'right',
+      render: (v) => (v != null ? v : '-') },
+    { title: '方数', dataIndex: 'goods_cbm', key: 'goods_cbm', width: 100, align: 'right',
+      render: (v) => (v != null ? v.toFixed(3) : '-') },
+    { title: '毛重', dataIndex: 'gross_kgs', key: 'gross_kgs', width: 100, align: 'right',
+      render: (v) => (v != null ? v.toFixed(2) : '-') },
+    { title: '应付(元)', dataIndex: 'ar_amt_cy', key: 'ar_amt_cy', width: 120, align: 'right',
+      render: (v) => <Text style={{ color: v > 0 ? '#1677ff' : '#999' }}>{v > 0 ? formatMoney(v) : '待核价'}</Text> },
+    { title: '已付(元)', dataIndex: 'paid_amt', key: 'paid_amt', width: 105, align: 'right',
+      render: (v, r) => (Number(r.ar_amt_cy) > 0
+        ? <Text style={{ color: v > 0 ? '#52c41a' : '#bbb' }}>{formatMoney(v)}</Text>
+        : <Text style={{ color: '#bbb' }}>-</Text>) },
+    { title: '未付(元)', dataIndex: 'unpaid_amt', key: 'unpaid_amt', width: 105, align: 'right',
+      render: (v, r) => {
+        if (r.close_status === 20) return <Text style={{ color: '#bbb' }}>已关闭</Text>;
+        if (!(Number(r.ar_amt_cy) > 0)) return <Text style={{ color: '#bbb' }}>-</Text>;
+        return <Text style={{ color: v > 0 ? '#fa8c16' : '#52c41a' }}>{v > 0 ? formatMoney(v) : '已结清'}</Text>;
+      } },
     { title: '操作', key: 'action', width: 60, fixed: 'right',
       render: (_, record) => (
         <Button type="link" size="small" icon={<EyeOutlined />} onClick={() => showDetail(record)}>详情</Button>
@@ -408,6 +426,46 @@ function ClientPortal() {
       children: (
         <>
           {stats && (
+            <Card
+              size="small"
+              style={{ marginBottom: 16, background: '#f7fbff', borderColor: '#d6e8ff' }}
+              title={<Space><DollarOutlined /><span>费用结算</span></Space>}
+            >
+              <Row gutter={16}>
+                <Col span={8}>
+                  <Statistic
+                    title="应付合计（元）"
+                    value={stats.totalAR}
+                    precision={2}
+                    valueStyle={{ fontSize: 24, color: '#1677ff' }}
+                  />
+                </Col>
+                <Col span={8}>
+                  <Statistic
+                    title="已付金额（元）"
+                    value={stats.totalPaid}
+                    precision={2}
+                    valueStyle={{ fontSize: 24, color: '#52c41a' }}
+                  />
+                </Col>
+                <Col span={8}>
+                  <Statistic
+                    title="待付余额（元）"
+                    value={stats.totalUnpaid}
+                    precision={2}
+                    valueStyle={{
+                      fontSize: 24,
+                      color: stats.totalUnpaid > 0 ? '#fa8c16' : '#52c41a',
+                    }}
+                  />
+                </Col>
+              </Row>
+              <div style={{ marginTop: 8, fontSize: 12, color: '#8c8c8c' }}>
+                待付余额 = 应付合计 − 已付金额，已剔除已关闭订单。
+              </div>
+            </Card>
+          )}
+          {stats && (
             <Row gutter={16} style={{ marginBottom: 24 }}>
               <Col span={6}>
                 <Card><Statistic title="总订单数" value={stats.totalOrders} prefix={<FileTextOutlined />} /></Card>
@@ -437,13 +495,38 @@ function ClientPortal() {
             }
           >
             <Table
+              className="client-order-table"
               columns={orderColumns}
               dataSource={orders}
               rowKey="job_id"
               loading={loading}
-              pagination={{ ...pagination, showSizeChanger: true, showTotal: (t) => `共 ${t} 条` }}
+              bordered
+              sticky
+              summary={() => (
+                <Table.Summary.Row>
+                  {orderColumns.map((col, idx) => {
+                    const s = orderSummary || {};
+                    let content = null;
+                    if (col.key === 'job_no') content = '合计';
+                    else if (col.key === 'ar_amt_cy') content = formatMoney(s.ar_amt_cy);
+                    else if (col.key === 'paid_amt') content = formatMoney(s.paid_amt);
+                    else if (col.key === 'unpaid_amt') content = formatMoney(s.unpaid_amt);
+                    return (
+                      <Table.Summary.Cell key={col.key} index={idx} align={col.align}>
+                        {content !== null ? <Text strong>{content}</Text> : null}
+                      </Table.Summary.Cell>
+                    );
+                  })}
+                </Table.Summary.Row>
+              )}
+              pagination={{
+                ...pagination,
+                showSizeChanger: true,
+                pageSizeOptions: ['20', '50', '100', '200'],
+                showTotal: (t) => `共 ${t} 条`,
+              }}
               onChange={handleTableChange}
-              scroll={{ x: 1400 }}
+              scroll={{ x: 1450 }}
               size="small"
             />
           </Card>
@@ -576,6 +659,25 @@ function ClientPortal() {
 
   return (
     <Layout style={{ minHeight: '100vh' }}>
+      <style>{`
+        .client-order-table .ant-table-thead > tr > th {
+          background: #f5f7fa !important;
+          color: #1f2329 !important;
+          font-weight: 600 !important;
+          font-size: 12px !important;
+          padding: 8px 10px !important;
+          white-space: nowrap;
+        }
+        .client-order-table .ant-table-tbody > tr > td {
+          padding: 7px 10px !important;
+          font-size: 12px !important;
+        }
+        .client-order-table .ant-table-summary > tr > td {
+          background: #fafafa !important;
+          font-size: 12px !important;
+          padding: 8px 10px !important;
+        }
+      `}</style>
       <Header style={{
         background: 'linear-gradient(135deg, #1B4F72, #2E86C1)',
         display: 'flex', alignItems: 'center', justifyContent: 'space-between',
@@ -632,8 +734,21 @@ function ClientPortal() {
             <Descriptions.Item label="毛重">{detailOrder.gross_kgs?.toFixed(2)}</Descriptions.Item>
             <Descriptions.Item label="箱数">{detailOrder.cnt_nos}</Descriptions.Item>
             <Descriptions.Item label="计费类型">{detailOrder.charging_type}</Descriptions.Item>
-            <Descriptions.Item label="AR金额">{detailOrder.ar_amt?.toFixed(2)}</Descriptions.Item>
-            <Descriptions.Item label="AP金额">{detailOrder.ap_amt?.toFixed(2)}</Descriptions.Item>
+            <Descriptions.Item label="应付金额(元)">
+              {detailOrder.ar_amt_cy > 0
+                ? detailOrder.ar_amt_cy.toFixed(2)
+                : <Text type="secondary">待核价</Text>}
+            </Descriptions.Item>
+            <Descriptions.Item label="已付金额(元)">
+              {detailOrder.ar_amt_cy > 0 ? (detailOrder.paid_amt || 0).toFixed(2) : '-'}
+            </Descriptions.Item>
+            <Descriptions.Item label="未付金额(元)">
+              {detailOrder.ar_amt_cy > 0
+                ? (detailOrder.unpaid_amt > 0
+                    ? <Text style={{ color: '#fa8c16' }}>{detailOrder.unpaid_amt.toFixed(2)}</Text>
+                    : <Tag color="green">已结清</Tag>)
+                : '-'}
+            </Descriptions.Item>
             <Descriptions.Item label="运费吨">{detailOrder.freighttons?.toFixed(2)}</Descriptions.Item>
             <Descriptions.Item label="关账状态">{detailOrder.close_status}</Descriptions.Item>
             <Descriptions.Item label="同步时间">{detailOrder.synced_at?.slice(0, 16)}</Descriptions.Item>
