@@ -6,3 +6,29 @@ data/
 *.db.backup
 *.json.backup
 .DS_Store
+
+# ===== 本地运维脚本（含明文企业微信 corpid/secret，禁止入库）=====
+scripts/
+
+# ===== Bot 运行文件（含硬编码 token/key，禁止入库）=====
+server/wechaty-bot.mjs
+server/wcf-bridge.js
+server/wcf-server.py
+server/wecom-bot.py
+ngrok/
+rpa-bot/
+meiou-bot.memory-card.json
+
+# ===== 运行时上传的业务文件 =====
+server/uploads/
+
+# ===== 临时构建日志与本地启动脚本 =====
+build-*.txt
+run_update.bat
+start.bat
+
+# ===== 智能体对话归档与本地规则 =====
+.trae/
+
+# ===== 误操作产生的乱码文件名 =====
+s -ExecutionPolicy*
