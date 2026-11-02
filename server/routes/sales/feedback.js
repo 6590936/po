@@ -1,15 +1,19 @@
 import { Router } from 'express';
 import { getDb } from '../../database.js';
 import { handle, succ, fail, buildUpdateFields } from '../../utils/response.js';
+import { isAdminUser, tenantScope } from '../../utils/scope.js';
 
 const router = Router();
 
 router.get('/', handle((req, res) => {
   const db = getDb();
   const { user_id, keyword, page = 1, pageSize = 20 } = req.query;
+  const scope = tenantScope(req.user);
   let sql = 'SELECT f.*, u.name as user_name FROM feedback_summaries f LEFT JOIN users u ON f.user_id = u.id WHERE 1=1';
   const params = [];
-  if (user_id) { sql += ' AND f.user_id = ?'; params.push(user_id); }
+  if (scope !== undefined) { sql += ' AND f.tenant_id = ?'; params.push(scope); }
+  if (!isAdminUser(req.user)) { sql += ' AND f.user_id = ?'; params.push(req.user.id); }
+  else if (user_id) { sql += ' AND f.user_id = ?'; params.push(user_id); }
   if (keyword) { sql += ' AND (f.title LIKE ? OR f.content LIKE ? OR f.lessons_learned LIKE ?)'; params.push(`%${keyword}%`, `%${keyword}%`, `%${keyword}%`); }
   sql += ' ORDER BY f.created_at DESC';
   const total = db.prepare(sql.replace(/SELECT.*?FROM/, 'SELECT COUNT(*) as total FROM')).get(...params)?.total || 0;
@@ -23,6 +27,9 @@ router.get('/:id', handle((req, res) => {
   const db = getDb();
   const item = db.prepare('SELECT f.*, u.name as user_name FROM feedback_summaries f LEFT JOIN users u ON f.user_id = u.id WHERE f.id = ?').get(req.params.id);
   if (!item) return fail(res, '记录不存在', 404);
+  const scope = tenantScope(req.user);
+  if (scope !== undefined && item.tenant_id !== scope) return fail(res, '记录不存在', 404);
+  if (!isAdminUser(req.user) && item.user_id !== req.user.id) return fail(res, '记录不存在', 404);
   succ(res, item);
 }));
 
@@ -32,14 +39,19 @@ router.post('/', handle((req, res) => {
   if (!title) return fail(res, '标题不能为空');
   const now = new Date().toISOString();
   const result = db.prepare(`
-    INSERT INTO feedback_summaries (user_id, title, content, related_call_ids, lessons_learned, action_items, file_url, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(req.user.id, title, content || '', JSON.stringify(related_call_ids || []), lessons_learned || '', action_items || '', file_url || '', now, now);
+    INSERT INTO feedback_summaries (user_id, tenant_id, title, content, related_call_ids, lessons_learned, action_items, file_url, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(req.user.id, req.user.tenant_id || null, title, content || '', JSON.stringify(related_call_ids || []), lessons_learned || '', action_items || '', file_url || '', now, now);
   succ(res, { id: result.lastInsertRowid });
 }));
 
 router.put('/:id', handle((req, res) => {
   const db = getDb();
+  const existing = db.prepare('SELECT * FROM feedback_summaries WHERE id = ?').get(req.params.id);
+  if (!existing) return fail(res, '记录不存在', 404);
+  const scope = tenantScope(req.user);
+  if (scope !== undefined && existing.tenant_id !== scope) return fail(res, '记录不存在', 404);
+  if (!isAdminUser(req.user) && existing.user_id !== req.user.id) return fail(res, '记录不存在', 404);
   const { fields, values } = buildUpdateFields(req.body, {
     title: 'title', content: 'content',
     lessons_learned: 'lessons_learned', action_items: 'action_items',
@@ -57,7 +69,13 @@ router.put('/:id', handle((req, res) => {
 }));
 
 router.delete('/:id', handle((req, res) => {
-  getDb().prepare('DELETE FROM feedback_summaries WHERE id = ?').run(req.params.id);
+  const db = getDb();
+  const existing = db.prepare('SELECT * FROM feedback_summaries WHERE id = ?').get(req.params.id);
+  if (!existing) return fail(res, '记录不存在', 404);
+  const scope = tenantScope(req.user);
+  if (scope !== undefined && existing.tenant_id !== scope) return fail(res, '记录不存在', 404);
+  if (!isAdminUser(req.user) && existing.user_id !== req.user.id) return fail(res, '记录不存在', 404);
+  db.prepare('DELETE FROM feedback_summaries WHERE id = ?').run(req.params.id);
   succ(res);
 }));
 

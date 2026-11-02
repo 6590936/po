@@ -117,6 +117,7 @@ function FeeTemplates() {
         <Space>
           <Text strong>{v}</Text>
           {r.is_default ? <Tag color="gold">默认</Tag> : null}
+          {r.is_global ? <Tag color="blue">平台公共</Tag> : null}
         </Space>
       ),
     },
@@ -135,14 +136,18 @@ function FeeTemplates() {
       render: (_, r) => (
         <Space size="small">
           <Button type="link" size="small" icon={<EyeOutlined />} onClick={() => handlePreview(r)}>预览</Button>
-          <Button type="link" size="small" icon={<EditOutlined />} onClick={() => handleEdit(r)}>编辑</Button>
-          <Button type="link" size="small" icon={<CopyOutlined />} onClick={() => handleCopy(r)}>复制</Button>
-          {!r.is_default && (
-            <Button type="link" size="small" icon={<StarOutlined />} onClick={() => handleSetDefault(r)}>设为默认</Button>
+          {r.can_edit !== false && (
+            <>
+              <Button type="link" size="small" icon={<EditOutlined />} onClick={() => handleEdit(r)}>编辑</Button>
+              <Button type="link" size="small" icon={<CopyOutlined />} onClick={() => handleCopy(r)}>复制</Button>
+              {!r.is_default && (
+                <Button type="link" size="small" icon={<StarOutlined />} onClick={() => handleSetDefault(r)}>设为默认</Button>
+              )}
+              <Popconfirm title="确认删除？" onConfirm={() => handleDelete(r.id)}>
+                <Button type="link" size="small" danger icon={<DeleteOutlined />}>删除</Button>
+              </Popconfirm>
+            </>
           )}
-          <Popconfirm title="确认删除？" onConfirm={() => handleDelete(r.id)}>
-            <Button type="link" size="small" danger icon={<DeleteOutlined />}>删除</Button>
-          </Popconfirm>
         </Space>
       ),
     },

@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { getDb } from '../../database.js';
 import { handle, succ, fail, buildUpdateFields } from '../../utils/response.js';
+import { isAdminUser, tenantScope } from '../../utils/scope.js';
 
 const router = Router();
 
@@ -18,23 +19,26 @@ router.get('/stats/mine', handle((req, res) => {
 router.get('/', handle((req, res) => {
   const db = getDb();
   const { user_id, customer_id, keyword, page = 1, pageSize = 20 } = req.query;
-  let sql = `
+  const scope = tenantScope(req.user);
+  const params = [];
+  let where = ' WHERE 1=1';
+  if (scope !== undefined) { where += ' AND cl.tenant_id = ?'; params.push(scope); }
+  if (!isAdminUser(req.user)) { where += ' AND cl.user_id = ?'; params.push(req.user.id); }
+  else if (user_id) { where += ' AND cl.user_id = ?'; params.push(user_id); }
+  if (customer_id) { where += ' AND cl.customer_id = ?'; params.push(customer_id); }
+  if (keyword) { where += ' AND (cl.customer_name LIKE ? OR cl.content LIKE ? OR cl.customer_response LIKE ?)'; params.push(`%${keyword}%`, `%${keyword}%`, `%${keyword}%`); }
+
+  const total = db.prepare(`SELECT COUNT(*) as total FROM call_logs cl${where}`).get(...params)?.total || 0;
+
+  const sql = `
     SELECT cl.*, u.name as user_name,
       (SELECT COUNT(*) FROM call_reviews WHERE call_log_id = cl.id) as review_count
     FROM call_logs cl
-    LEFT JOIN users u ON cl.user_id = u.id
-    WHERE 1=1
+    LEFT JOIN users u ON cl.user_id = u.id${where}
+    ORDER BY cl.created_at DESC
+    LIMIT ? OFFSET ?
   `;
-  const params = [];
-  if (user_id) { sql += ' AND cl.user_id = ?'; params.push(user_id); }
-  if (customer_id) { sql += ' AND cl.customer_id = ?'; params.push(customer_id); }
-  if (keyword) { sql += ' AND (cl.customer_name LIKE ? OR cl.content LIKE ? OR cl.customer_response LIKE ?)'; params.push(`%${keyword}%`, `%${keyword}%`, `%${keyword}%`); }
-  sql += ' ORDER BY cl.created_at DESC';
-  const countSql = sql.replace(/SELECT.*?FROM/, 'SELECT COUNT(*) as total FROM').replace(/\(SELECT.*?review_count/, '0 as review_count');
-  const total = db.prepare(countSql).get(...params)?.total || 0;
-  sql += ' LIMIT ? OFFSET ?';
-  params.push(Number(pageSize), (Number(page) - 1) * Number(pageSize));
-  const list = db.prepare(sql).all(...params);
+  const list = db.prepare(sql).all(...params, Number(pageSize), (Number(page) - 1) * Number(pageSize));
   succ(res, { list, total, page: Number(page), pageSize: Number(pageSize) });
 }));
 
@@ -48,6 +52,9 @@ router.get('/:id', handle((req, res) => {
     WHERE cl.id = ?
   `).get(req.params.id);
   if (!call) return fail(res, '记录不存在', 404);
+  const scope = tenantScope(req.user);
+  if (scope !== undefined && call.tenant_id !== scope) return fail(res, '记录不存在', 404);
+  if (!isAdminUser(req.user) && call.user_id !== req.user.id) return fail(res, '记录不存在', 404);
   call.reviews = db.prepare(`
     SELECT cr.*, u.name as reviewer_name FROM call_reviews cr
     LEFT JOIN users u ON cr.reviewer_id = u.id
@@ -62,14 +69,19 @@ router.post('/', handle((req, res) => {
   if (!content) return fail(res, '通话内容不能为空');
   const now = new Date().toISOString();
   const result = db.prepare(`
-    INSERT INTO call_logs (user_id, customer_id, customer_name, duration_minutes, scenario_id, script_id, content, customer_response, self_review, next_steps, file_url, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(req.user.id, customer_id || null, customer_name || '', duration_minutes || 0, scenario_id || 0, script_id || null, content, customer_response || '', self_review || '', next_steps || '', file_url || '', now, now);
+    INSERT INTO call_logs (user_id, tenant_id, customer_id, customer_name, duration_minutes, scenario_id, script_id, content, customer_response, self_review, next_steps, file_url, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(req.user.id, req.user.tenant_id || null, customer_id || null, customer_name || '', duration_minutes || 0, scenario_id || 0, script_id || null, content, customer_response || '', self_review || '', next_steps || '', file_url || '', now, now);
   succ(res, { id: result.lastInsertRowid });
 }));
 
 router.put('/:id', handle((req, res) => {
   const db = getDb();
+  const existing = db.prepare('SELECT * FROM call_logs WHERE id = ?').get(req.params.id);
+  if (!existing) return fail(res, '记录不存在', 404);
+  const scope = tenantScope(req.user);
+  if (scope !== undefined && existing.tenant_id !== scope) return fail(res, '记录不存在', 404);
+  if (!isAdminUser(req.user) && existing.user_id !== req.user.id) return fail(res, '记录不存在', 404);
   const { fields, values } = buildUpdateFields(req.body, {
     customer_name: 'customer_name', duration_minutes: 'duration_minutes',
     content: 'content', customer_response: 'customer_response',
@@ -84,12 +96,23 @@ router.put('/:id', handle((req, res) => {
 }));
 
 router.delete('/:id', handle((req, res) => {
-  getDb().prepare('DELETE FROM call_logs WHERE id = ?').run(req.params.id);
+  const db = getDb();
+  const existing = db.prepare('SELECT * FROM call_logs WHERE id = ?').get(req.params.id);
+  if (!existing) return fail(res, '记录不存在', 404);
+  const scope = tenantScope(req.user);
+  if (scope !== undefined && existing.tenant_id !== scope) return fail(res, '记录不存在', 404);
+  if (!isAdminUser(req.user) && existing.user_id !== req.user.id) return fail(res, '记录不存在', 404);
+  db.prepare('DELETE FROM call_logs WHERE id = ?').run(req.params.id);
   succ(res);
 }));
 
 router.post('/:id/review', handle((req, res) => {
   const db = getDb();
+  const call = db.prepare('SELECT * FROM call_logs WHERE id = ?').get(req.params.id);
+  if (!call) return fail(res, '记录不存在', 404);
+  const scope = tenantScope(req.user);
+  if (scope !== undefined && call.tenant_id !== scope) return fail(res, '记录不存在', 404);
+
   const { comment, rating } = req.body;
   if (!comment) return fail(res, '点评内容不能为空');
   const result = db.prepare('INSERT INTO call_reviews (call_log_id, reviewer_id, comment, rating, created_at) VALUES (?, ?, ?, ?, ?)').run(req.params.id, req.user.id, comment, rating || 0, new Date().toISOString());

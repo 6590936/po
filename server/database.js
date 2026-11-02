@@ -436,6 +436,7 @@ function createTables() {
       category TEXT NOT NULL DEFAULT 'product',
       file_url TEXT,
       author_id INTEGER REFERENCES users(id),
+      tenant_id INTEGER REFERENCES tenants(id),
       status TEXT DEFAULT 'published',
       view_count INTEGER DEFAULT 0,
       is_pinned INTEGER DEFAULT 0,
@@ -454,6 +455,7 @@ function createTables() {
       keywords TEXT DEFAULT '',
       file_url TEXT DEFAULT '',
       author_id INTEGER REFERENCES users(id),
+      tenant_id INTEGER REFERENCES tenants(id),
       usage_count INTEGER DEFAULT 0,
       status TEXT DEFAULT 'published',
       created_at TEXT NOT NULL,
@@ -474,6 +476,7 @@ function createTables() {
       description TEXT DEFAULT '',
       duration_days INTEGER DEFAULT 14,
       status TEXT DEFAULT 'active',
+      tenant_id INTEGER REFERENCES tenants(id),
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -496,6 +499,7 @@ function createTables() {
       user_id INTEGER NOT NULL REFERENCES users(id),
       plan_id INTEGER NOT NULL REFERENCES onboarding_plans(id),
       task_id INTEGER NOT NULL REFERENCES onboarding_tasks(id) ON DELETE CASCADE,
+      tenant_id INTEGER REFERENCES tenants(id),
       status TEXT DEFAULT 'pending',
       score INTEGER,
       mentor_comment TEXT,
@@ -649,6 +653,7 @@ function createTables() {
       name TEXT NOT NULL,
       is_default INTEGER DEFAULT 0,
       created_by INTEGER REFERENCES users(id),
+      tenant_id INTEGER REFERENCES tenants(id),
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -779,6 +784,15 @@ function migrateFromJSON() {
   }
 }
 
+function ensureColumn(table, column, definition) {
+  try {
+    const columns = db.pragma(`table_info(${table})`);
+    if (!columns.some(c => c.name === column)) {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    }
+  } catch (_) {}
+}
+
 function runTenantMigration() {
   try { db.exec("ALTER TABLE roles ADD COLUMN tenant_id INTEGER REFERENCES tenants(id)"); } catch {}
   const now = new Date().toISOString();
@@ -793,21 +807,107 @@ function runTenantMigration() {
 
   const tenantId = platformTenant.id;
 
-  db.prepare('UPDATE users SET tenant_id = ? WHERE tenant_id IS NULL').run(tenantId);
+  // 存量数据归属主体：优先取现有用户最多的公司（老系统数据属于实际在用的公司），
+  // 没有存量用户时才落到默认租户
+  const legacyTenant = db.prepare(
+    'SELECT tenant_id, COUNT(*) AS cnt FROM users WHERE tenant_id IS NOT NULL GROUP BY tenant_id ORDER BY cnt DESC LIMIT 1'
+  ).get();
+  const legacyTenantId = legacyTenant ? legacyTenant.tenant_id : tenantId;
+
+  db.prepare('UPDATE users SET tenant_id = ? WHERE tenant_id IS NULL').run(legacyTenantId);
   // 系统内置 admin 不受租户隔离，tenant_id 保持 NULL
   db.prepare("UPDATE users SET tenant_id = NULL WHERE username = 'admin'").run();
-  db.prepare("UPDATE users SET role_id = (SELECT id FROM roles WHERE name = users.role AND roles.tenant_id = ? LIMIT 1) WHERE role_id IS NULL").run(tenantId);
+  db.prepare("UPDATE users SET role_id = (SELECT id FROM roles WHERE name = users.role AND roles.tenant_id = ? LIMIT 1) WHERE role_id IS NULL").run(legacyTenantId);
   db.prepare("UPDATE users SET status = 'active' WHERE status IS NULL").run();
 
-  db.prepare('UPDATE roles SET tenant_id = ? WHERE tenant_id IS NULL').run(tenantId);
+  db.prepare('UPDATE roles SET tenant_id = ? WHERE tenant_id IS NULL').run(legacyTenantId);
+  // 系统内置 admin 使用的角色属于平台级角色，不归属任何主体
+  try {
+    const sysAdminRole = db.prepare("SELECT role_id FROM users WHERE username = 'admin' AND role_id IS NOT NULL").get();
+    if (sysAdminRole) db.prepare('UPDATE roles SET tenant_id = NULL WHERE id = ?').run(sysAdminRole.role_id);
+  } catch (_) {}
 
-  db.prepare('UPDATE customers SET tenant_id = ? WHERE tenant_id IS NULL').run(tenantId);
+  db.prepare('UPDATE customers SET tenant_id = ? WHERE tenant_id IS NULL').run(legacyTenantId);
 
   try {
     const adminRole = db.prepare("SELECT id FROM roles WHERE name = 'admin' AND tenant_id = ?").get(tenantId);
     if (adminRole) {
       db.prepare('INSERT OR IGNORE INTO role_permissions (role_id, permission_key) VALUES (?, ?)')
         .run(adminRole.id, 'system:platform');
+    }
+  } catch (_) {}
+
+  // 业务表补充主体字段（按 user_id 回填，海运费批次/订舱口历史数据保持空值=历史共享）
+  const tenantTables = [
+    'daily_activities', 'quotes', 'weekly_reports', 'call_logs', 'feedback_summaries',
+    'shipping_rate_batches', 'shipping_rate_suppliers', 'fee_templates',
+    'sales_materials', 'sales_scripts', 'onboarding_plans', 'user_onboarding',
+  ];
+  for (const table of tenantTables) {
+    ensureColumn(table, 'tenant_id', 'INTEGER REFERENCES tenants(id)');
+  }
+  for (const table of ['daily_activities', 'quotes', 'weekly_reports', 'call_logs', 'feedback_summaries']) {
+    try {
+      db.prepare(
+        `UPDATE ${table} SET tenant_id = (SELECT u.tenant_id FROM users u WHERE u.id = ${table}.user_id) WHERE tenant_id IS NULL`
+      ).run();
+    } catch (_) {}
+  }
+
+  // 海运费历史批次/订舱口无主体归属，归入存量数据所属主体，避免主体用户上线后看不到存量报价
+  try {
+    db.prepare(
+      "UPDATE shipping_rate_batches SET tenant_id = COALESCE((SELECT u.tenant_id FROM users u WHERE u.id = shipping_rate_batches.created_by), ?) WHERE tenant_id IS NULL"
+    ).run(legacyTenantId);
+    db.prepare('UPDATE shipping_rate_suppliers SET tenant_id = ? WHERE tenant_id IS NULL').run(legacyTenantId);
+  } catch (_) {}
+
+  // 费用模版历史数据按创建人归属主体；创建人无主体（平台管理员）的模版保持 tenant_id 为空，
+  // 作为平台公共模版对所有主体可见，不能被回填到某个具体主体
+  try {
+    db.prepare(
+      "UPDATE fee_templates SET tenant_id = (SELECT u.tenant_id FROM users u WHERE u.id = fee_templates.created_by) WHERE tenant_id IS NULL AND (SELECT u.tenant_id FROM users u WHERE u.id = fee_templates.created_by) IS NOT NULL"
+    ).run();
+  } catch (_) {}
+  // 修复历史回填：平台管理员创建的模版曾被错误钉到某个主体上，恢复为平台公共模版
+  try {
+    db.prepare(
+      "UPDATE fee_templates SET tenant_id = NULL WHERE tenant_id IS NOT NULL AND created_by IN (SELECT id FROM users WHERE tenant_id IS NULL AND role = 'admin')"
+    ).run();
+  } catch (_) {}
+
+  // 销售管理：资料库/话术库按作者归属主体，新人培训按计划归属，
+  // 培训进度按被培训用户归属；无归属信息的统一落到存量数据所属主体
+  try {
+    db.prepare(
+      "UPDATE sales_materials SET tenant_id = COALESCE((SELECT u.tenant_id FROM users u WHERE u.id = sales_materials.author_id), ?) WHERE tenant_id IS NULL"
+    ).run(legacyTenantId);
+    db.prepare(
+      "UPDATE sales_scripts SET tenant_id = COALESCE((SELECT u.tenant_id FROM users u WHERE u.id = sales_scripts.author_id), ?) WHERE tenant_id IS NULL"
+    ).run(legacyTenantId);
+    db.prepare(
+      "UPDATE user_onboarding SET tenant_id = COALESCE((SELECT u.tenant_id FROM users u WHERE u.id = user_onboarding.user_id), ?) WHERE tenant_id IS NULL"
+    ).run(legacyTenantId);
+    db.prepare('UPDATE onboarding_plans SET tenant_id = ? WHERE tenant_id IS NULL').run(legacyTenantId);
+  } catch (_) {}
+
+  // 租户角色的平台专属项清洗：
+  // 平台专属菜单（FMS数据同步、企业微信推送）从租户角色中移除；
+  // 平台专属权限（data:all / system:platform）不再保留，转换为租户内的等效能力
+  try {
+    const tenantRoleIds = db.prepare('SELECT id FROM roles WHERE tenant_id IS NOT NULL').all().map(r => r.id);
+    const delMenu = db.prepare('DELETE FROM role_menus WHERE role_id = ? AND menu_key = ?');
+    const delPerm = db.prepare('DELETE FROM role_permissions WHERE role_id = ? AND permission_key = ?');
+    const hasPerm = db.prepare('SELECT 1 AS ok FROM role_permissions WHERE role_id = ? AND permission_key = ?');
+    const insPerm = db.prepare('INSERT OR IGNORE INTO role_permissions (role_id, permission_key) VALUES (?, ?)');
+    for (const roleId of tenantRoleIds) {
+      for (const menuKey of ['/yunwuyun', '/wechat']) delMenu.run(roleId, menuKey);
+      const hadPlatform = !!hasPerm.get(roleId, 'system:platform');
+      const hadAllData = !!hasPerm.get(roleId, 'data:all');
+      if (hadPlatform || hadAllData) insPerm.run(roleId, 'data:tenant');
+      if (hadPlatform) insPerm.run(roleId, 'system:tenant_admin');
+      delPerm.run(roleId, 'system:platform');
+      delPerm.run(roleId, 'data:all');
     }
   } catch (_) {}
 
@@ -1364,26 +1464,26 @@ export const CustomerOps = {
 
 // ===== 每日活动操作 =====
 export const DailyActivityOps = {
-  createOrUpdate(userId, data) {
+  createOrUpdate(userId, data, tenantId) {
     const today = new Date().toISOString().slice(0, 10);
     const existing = db.prepare('SELECT * FROM daily_activities WHERE user_id = ? AND date = ?').get(userId, today);
     const now = new Date().toISOString();
 
     if (existing) {
       db.prepare(
-        `UPDATE daily_activities SET calls = ?, wechat_adds = ?, emails = ?, effective_comms = ?, quotes_sent = ?, crm_updates = ?, notes = ?, updated_at = ? WHERE id = ?`
+        `UPDATE daily_activities SET calls = ?, wechat_adds = ?, emails = ?, effective_comms = ?, quotes_sent = ?, crm_updates = ?, notes = ?, tenant_id = COALESCE(tenant_id, ?), updated_at = ? WHERE id = ?`
       ).run(
         data.calls ?? existing.calls, data.wechat_adds ?? existing.wechat_adds,
         data.emails ?? existing.emails, data.effective_comms ?? existing.effective_comms,
         data.quotes_sent ?? existing.quotes_sent, data.crm_updates ?? existing.crm_updates,
-        data.notes ?? existing.notes, now, existing.id
+        data.notes ?? existing.notes, tenantId || null, now, existing.id
       );
       return db.prepare('SELECT * FROM daily_activities WHERE id = ?').get(existing.id);
     } else {
       const result = db.prepare(
-        `INSERT INTO daily_activities (user_id, date, calls, wechat_adds, emails, effective_comms, quotes_sent, crm_updates, notes, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      ).run(userId, today, data.calls || 0, data.wechat_adds || 0, data.emails || 0, data.effective_comms || 0, data.quotes_sent || 0, data.crm_updates || 0, data.notes || '', now, now);
+        `INSERT INTO daily_activities (user_id, tenant_id, date, calls, wechat_adds, emails, effective_comms, quotes_sent, crm_updates, notes, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(userId, tenantId || null, today, data.calls || 0, data.wechat_adds || 0, data.emails || 0, data.effective_comms || 0, data.quotes_sent || 0, data.crm_updates || 0, data.notes || '', now, now);
       return db.prepare('SELECT * FROM daily_activities WHERE id = ?').get(result.lastInsertRowid);
     }
   },
@@ -1392,18 +1492,22 @@ export const DailyActivityOps = {
     return db.prepare('SELECT * FROM daily_activities WHERE user_id = ? AND date = ?').get(userId, date) || null;
   },
 
-  findByRange(userId, isAdmin, start, end) {
+  findByRange(userId, isAdmin, start, end, tenantId) {
     let query = 'SELECT a.*, u.name as user_name FROM daily_activities a LEFT JOIN users u ON a.user_id = u.id WHERE a.date >= ? AND a.date <= ?';
     const params = [start, end];
     if (!isAdmin) {
       query += ' AND a.user_id = ?';
       params.push(userId);
     }
+    if (tenantId !== undefined) {
+      query += ' AND a.tenant_id = ?';
+      params.push(tenantId);
+    }
     query += ' ORDER BY a.date DESC';
     return db.prepare(query).all(...params);
   },
 
-  getStats(userId, isAdmin, period) {
+  getStats(userId, isAdmin, period, tenantId) {
     const now = new Date();
     let start;
     if (period === 'week') {
@@ -1420,6 +1524,10 @@ export const DailyActivityOps = {
     if (!isAdmin) {
       query += ' AND user_id = ?';
       params.push(userId);
+    }
+    if (tenantId !== undefined) {
+      query += ' AND tenant_id = ?';
+      params.push(tenantId);
     }
     const results = db.prepare(query).all(...params);
 
@@ -1459,18 +1567,33 @@ export const DailyActivityOps = {
 export const QuoteOps = {
   create(data) {
     const result = db.prepare(
-      `INSERT INTO quotes (customer_id, user_id, route, container_type, amount, currency, status, valid_until, notes, created_at, responded_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(data.customer_id, data.user_id, data.route || '', data.container_type || '', data.amount || 0, data.currency || 'CNY', data.status || 'pending', data.valid_until || null, data.notes || '', new Date().toISOString(), null);
+      `INSERT INTO quotes (customer_id, user_id, tenant_id, route, container_type, amount, currency, status, valid_until, notes, created_at, responded_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(data.customer_id, data.user_id, data.tenant_id || null, data.route || '', data.container_type || '', data.amount || 0, data.currency || 'CNY', data.status || 'pending', data.valid_until || null, data.notes || '', new Date().toISOString(), null);
     return { id: result.lastInsertRowid };
   },
 
-  findAll({ userId, isAdmin, status, page = 1, pageSize = 20 } = {}) {
+  findById(id) {
+    return db.prepare('SELECT * FROM quotes WHERE id = ?').get(id) || null;
+  },
+
+  canAccess(quote, userId, isAdmin, tenantId) {
+    if (!quote) return false;
+    if (tenantId !== undefined && quote.tenant_id !== tenantId) return false;
+    if (isAdmin) return true;
+    return quote.user_id === userId;
+  },
+
+  findAll({ userId, isAdmin, status, page = 1, pageSize = 20, tenantId } = {}) {
     let conditions = [];
     let params = [];
     if (!isAdmin) {
       conditions.push('q.user_id = ?');
       params.push(userId);
+    }
+    if (tenantId !== undefined) {
+      conditions.push('q.tenant_id = ?');
+      params.push(tenantId);
     }
     if (status) {
       conditions.push('q.status = ?');
@@ -1527,12 +1650,16 @@ export const QuoteOps = {
     return true;
   },
 
-  getStats(userId, isAdmin) {
-    let query = 'SELECT * FROM quotes';
+  getStats(userId, isAdmin, tenantId) {
+    let query = 'SELECT * FROM quotes WHERE 1=1';
     const params = [];
     if (!isAdmin) {
-      query += ' WHERE user_id = ?';
+      query += ' AND user_id = ?';
       params.push(userId);
+    }
+    if (tenantId !== undefined) {
+      query += ' AND tenant_id = ?';
+      params.push(tenantId);
     }
     const quotes = db.prepare(query).all(...params);
 
@@ -1560,7 +1687,7 @@ export const QuoteOps = {
 
 // ===== 周报操作 =====
 export const WeeklyReportOps = {
-  createOrUpdate(userId, data) {
+  createOrUpdate(userId, data, tenantId) {
     const now = new Date();
     const weekStart = new Date(now);
     weekStart.setDate(now.getDate() - now.getDay() + 1);
@@ -1574,30 +1701,34 @@ export const WeeklyReportOps = {
 
     if (existing) {
       db.prepare(
-        `UPDATE weekly_reports SET new_customers = ?, effective_comms = ?, quotes_sent = ?, deals = ?, revenue = ?, top3_customers = ?, problems = ?, next_week_plan = ?, updated_at = ? WHERE id = ?`
+        `UPDATE weekly_reports SET new_customers = ?, effective_comms = ?, quotes_sent = ?, deals = ?, revenue = ?, top3_customers = ?, problems = ?, next_week_plan = ?, tenant_id = COALESCE(tenant_id, ?), updated_at = ? WHERE id = ?`
       ).run(
         data.new_customers ?? existing.new_customers, data.effective_comms ?? existing.effective_comms,
         data.quotes_sent ?? existing.quotes_sent, data.deals ?? existing.deals,
         data.revenue ?? existing.revenue, JSON.stringify(data.top3_customers ?? JSON.parse(existing.top3_customers || '[]')),
         data.problems ?? existing.problems, data.next_week_plan ?? existing.next_week_plan,
-        nowStr, existing.id
+        tenantId || null, nowStr, existing.id
       );
       return db.prepare('SELECT * FROM weekly_reports WHERE id = ?').get(existing.id);
     } else {
       const result = db.prepare(
-        `INSERT INTO weekly_reports (user_id, week_start, week_end, new_customers, effective_comms, quotes_sent, deals, revenue, top3_customers, problems, next_week_plan, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      ).run(userId, wsStr, weStr, data.new_customers || 0, data.effective_comms || 0, data.quotes_sent || 0, data.deals || 0, data.revenue || 0, JSON.stringify(data.top3_customers || []), data.problems || '', data.next_week_plan || '', nowStr, nowStr);
+        `INSERT INTO weekly_reports (user_id, tenant_id, week_start, week_end, new_customers, effective_comms, quotes_sent, deals, revenue, top3_customers, problems, next_week_plan, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(userId, tenantId || null, wsStr, weStr, data.new_customers || 0, data.effective_comms || 0, data.quotes_sent || 0, data.deals || 0, data.revenue || 0, JSON.stringify(data.top3_customers || []), data.problems || '', data.next_week_plan || '', nowStr, nowStr);
       return db.prepare('SELECT * FROM weekly_reports WHERE id = ?').get(result.lastInsertRowid);
     }
   },
 
-  findAll(userId, isAdmin, page = 1, pageSize = 20) {
-    let query = 'SELECT r.*, u.name as user_name FROM weekly_reports r LEFT JOIN users u ON r.user_id = u.id';
+  findAll(userId, isAdmin, page = 1, pageSize = 20, tenantId) {
+    let query = 'SELECT r.*, u.name as user_name FROM weekly_reports r LEFT JOIN users u ON r.user_id = u.id WHERE 1=1';
     const params = [];
     if (!isAdmin) {
-      query += ' WHERE r.user_id = ?';
+      query += ' AND r.user_id = ?';
       params.push(userId);
+    }
+    if (tenantId !== undefined) {
+      query += ' AND r.tenant_id = ?';
+      params.push(tenantId);
     }
     const countRow = db.prepare(`SELECT COUNT(*) as cnt FROM (${query})`).get(...params);
     const total = countRow.cnt;
@@ -1609,7 +1740,7 @@ export const WeeklyReportOps = {
     return { data: rows.map(r => ({ ...r, top3_customers: JSON.parse(r.top3_customers || '[]') })), total, page, pageSize };
   },
 
-  getWeekStats(userId, isAdmin) {
+  getWeekStats(userId, isAdmin, tenantId) {
     const now = new Date();
     const weekStart = new Date(now);
     weekStart.setDate(now.getDate() - now.getDay() + 1);
@@ -1622,17 +1753,25 @@ export const WeeklyReportOps = {
       actQuery += ' AND user_id = ?';
       actParams.push(userId);
     }
+    if (tenantId !== undefined) {
+      actQuery += ' AND tenant_id = ?';
+      actParams.push(tenantId);
+    }
     const activities = db.prepare(actQuery).all(...actParams);
 
     const totalCalls = activities.reduce((s, a) => s + (a.calls || 0), 0);
     const totalEffectiveComms = activities.reduce((s, a) => s + (a.effective_comms || 0), 0);
     const totalQuotes = activities.reduce((s, a) => s + (a.quotes_sent || 0), 0);
 
-    let custQuery = 'SELECT * FROM customers';
+    let custQuery = 'SELECT * FROM customers WHERE 1=1';
     const custParams = [];
     if (!isAdmin) {
-      custQuery += ' WHERE owner_id = ?';
+      custQuery += ' AND owner_id = ?';
       custParams.push(userId);
+    }
+    if (tenantId !== undefined) {
+      custQuery += ' AND tenant_id = ?';
+      custParams.push(tenantId);
     }
     const customers = db.prepare(custQuery).all(...custParams);
 

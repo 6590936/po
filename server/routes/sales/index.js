@@ -14,6 +14,8 @@ import onboardingRouter from './onboarding.js';
 import callsRouter from './calls.js';
 import feedbackRouter from './feedback.js';
 import dashboardRouter from './dashboard.js';
+import { getDb } from '../../database.js';
+import { tenantScope } from '../../utils/scope.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const uploadsDir = path.join(__dirname, '..', '..', 'uploads');
@@ -48,6 +50,17 @@ router.get('/preview', (req, res, next) => {
   try {
     const filePath = req.query.file;
     if (!filePath) return res.status(400).send('缺少文件参数');
+    const scope = tenantScope(req.user);
+    if (scope !== undefined) {
+      const db = getDb();
+      const foreign = db.prepare(`
+        SELECT 1 FROM sales_materials WHERE file_url = ? AND tenant_id IS NOT NULL AND tenant_id != ?
+        UNION ALL SELECT 1 FROM sales_scripts WHERE file_url = ? AND tenant_id IS NOT NULL AND tenant_id != ?
+        UNION ALL SELECT 1 FROM feedback_summaries WHERE file_url = ? AND tenant_id IS NOT NULL AND tenant_id != ?
+        UNION ALL SELECT 1 FROM call_logs WHERE file_url = ? AND tenant_id IS NOT NULL AND tenant_id != ?
+      `).get(filePath, scope, filePath, scope, filePath, scope, filePath, scope);
+      if (foreign) return res.status(404).send('文件不存在');
+    }
     const fullPath = path.join(__dirname, '..', '..', filePath.replace(/^\/api\/uploads\//, 'uploads/'));
     if (!fs.existsSync(fullPath)) return res.status(404).send('文件不存在');
     const ext = path.extname(fullPath).toLowerCase();

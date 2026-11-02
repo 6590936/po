@@ -485,6 +485,11 @@ router.post('/order/batch', async (req, res) => {
  */
 router.get('/orders', (req, res) => {
   try {
+    // FMS 订单为平台级数据，无主体归属，仅平台管理员可浏览全量列表
+    const perms = req.user.permissions || [];
+    if (req.user.tenant_id || !perms.includes('system:platform')) {
+      return res.status(403).json({ success: false, error: '仅平台管理员可查看全部订单轨迹' });
+    }
     const db = getDb();
     const page = parseInt(req.query.page) || 1;
     const pageSize = parseInt(req.query.pageSize) || 20;

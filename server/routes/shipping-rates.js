@@ -3,11 +3,25 @@ import multer from 'multer';
 import XLSX from 'xlsx';
 import { authenticateToken } from './auth.js';
 import { getDb } from '../database.js';
+import { isPlatformAdmin, tenantScope } from '../utils/scope.js';
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 
 router.use(authenticateToken);
+
+// 主体过滤条件（平台管理员不过滤）
+function tenantFilter(user, alias) {
+  const scope = tenantScope(user);
+  if (scope === undefined) return { sql: '', params: [] };
+  return { sql: ` AND ${alias}.tenant_id = ?`, params: [scope] };
+}
+
+function canAccessBatch(user, batch) {
+  if (!batch) return false;
+  if (isPlatformAdmin(user)) return true;
+  return batch.tenant_id === (user.tenant_id || -1);
+}
 
 function excelDateToStr(val) {
   if (typeof val === 'number' && val > 30000 && val < 80000) {
@@ -17,12 +31,146 @@ function excelDateToStr(val) {
   return val ? String(val).trim() : '';
 }
 
+// ==================== 报价单：按费用模版动态生成 ====================
+
+// 尾程派送注意事项：模版未配置 note 类费项时沿用默认内容
+const DEFAULT_NOTE_ITEMS = [
+  { name: '车架费', free: '3天', fee: '约45USD/天', note: '自柜子抵达仓库完成卸柜起计算，至空柜归还船公司为止' },
+  { name: '预提费', free: '—', fee: '约200USD/次', note: '双方确认送仓时间后，若车队已完成港口提柜，因海外仓侧原因无法接收柜子入仓，将产生额外预提费用，该费用按实际发生向客户收取' },
+  { name: '夜存费', free: '—', fee: '约50USD/天', note: '柜子从港口提柜出来后，未能直接送仓，需在堆场/车场临时过夜暂存所产生的费用，按实际发生收取' },
+  { name: '改地址/改派送方式', free: '需提前7天', fee: '可能产生约100USD改单费', note: '客户变更需提前沟通（如更改地址或者改自提）' },
+];
+
+// 解析使用的费用模版：
+// 指定模版 > 平台公共模版中的默认 > 本主体默认 > 名称「标准通用模版」 > 最新更新的一条
+// 平台公共模版（tenant_id 为空）对所有主体可见，主体模版仅本主体可见
+function resolveQuotationTemplate(db, templateId, user) {
+  const scope = tenantScope(user);
+  const isPlatform = scope === undefined;
+
+  if (templateId) {
+    const sql = isPlatform
+      ? 'SELECT * FROM fee_templates WHERE id = ?'
+      : 'SELECT * FROM fee_templates WHERE id = ? AND (tenant_id = ? OR tenant_id IS NULL)';
+    const picked = db.prepare(sql).get(...(isPlatform ? [templateId] : [templateId, scope]));
+    if (picked) return picked;
+  }
+
+  let tpl = db.prepare(
+    'SELECT * FROM fee_templates WHERE is_default = 1 AND tenant_id IS NULL ORDER BY id LIMIT 1'
+  ).get();
+  if (tpl) return tpl;
+
+  if (isPlatform) {
+    tpl = db.prepare(
+      'SELECT * FROM fee_templates WHERE is_default = 1 ORDER BY id LIMIT 1'
+    ).get();
+  } else {
+    tpl = db.prepare(
+      'SELECT * FROM fee_templates WHERE is_default = 1 AND tenant_id = ? ORDER BY id LIMIT 1'
+    ).get(scope);
+  }
+  if (tpl) return tpl;
+
+  tpl = db.prepare(
+    isPlatform
+      ? 'SELECT * FROM fee_templates WHERE name = ? ORDER BY id LIMIT 1'
+      : 'SELECT * FROM fee_templates WHERE name = ? AND (tenant_id = ? OR tenant_id IS NULL) ORDER BY id LIMIT 1'
+  ).get(...(isPlatform ? ['标准通用模版'] : ['标准通用模版', scope]));
+  if (tpl) return tpl;
+
+  tpl = db.prepare(
+    isPlatform
+      ? 'SELECT * FROM fee_templates ORDER BY updated_at DESC, id DESC LIMIT 1'
+      : 'SELECT * FROM fee_templates WHERE tenant_id = ? OR tenant_id IS NULL ORDER BY updated_at DESC, id DESC LIMIT 1'
+  ).get(...(isPlatform ? [] : [scope]));
+
+  return tpl || null;
+}
+
+// 由费用模版生成报价单费项（海运费取当前报价明细的实际运价）
+function buildQuotation(db, opts) {
+  const pol = opts.pol || '';
+  const pod = opts.pod || '';
+  const freight = Number(opts.freight) || 0;
+  const tpl = resolveQuotationTemplate(db, opts.templateId, opts.user);
+
+  let feeRows = [];
+  let noteRows = [];
+  if (tpl) {
+    const rows = db.prepare('SELECT * FROM fee_template_items WHERE template_id = ? ORDER BY sort_order, id').all(tpl.id);
+    feeRows = rows.filter(r => (r.category || 'fee') === 'fee');
+    noteRows = rows.filter(r => r.category === 'note');
+  }
+
+  const items = feeRows.map(ti => {
+    const currency = ti.currency || 'USD';
+    const raw = String(ti.amount_value == null ? '' : ti.amount_value).trim();
+    let amount;
+    if (ti.amount_type === 'freight') {
+      amount = currency + ' ' + freight + ' /柜';
+    } else if (/^[\d.,]+$/.test(raw)) {
+      amount = currency + ' ' + raw + ' /柜';
+    } else {
+      amount = raw || '-';
+    }
+    return {
+      name: ti.item_name,
+      standard: ti.standard || '按每柜计费',
+      amount,
+      note: ti.note || '',
+      currency,
+      amount_type: ti.amount_type || 'fixed',
+    };
+  });
+
+  // 模版未包含海运费项时，按当前报价明细的运价动态补一行基础海运费
+  if (!items.some(i => i.amount_type === 'freight')) {
+    items.unshift({
+      name: '基础海运费（' + pol + '-->' + pod + '）',
+      standard: '按每柜计费',
+      amount: 'USD ' + freight + ' /柜（含AMS+换单费）',
+      note: '主运输核心费用\n根据当日实际价格',
+      currency: 'USD',
+      amount_type: 'freight',
+    });
+  }
+
+  const notes = noteRows.length > 0
+    ? noteRows.map(tn => ({
+        name: tn.item_name,
+        free: tn.standard || '—',
+        fee: tn.amount_value || '—',
+        note: tn.note || '',
+      }))
+    : DEFAULT_NOTE_ITEMS;
+
+  let usd = 0;
+  let rmb = 0;
+  items.forEach(it => {
+    const m = String(it.amount || '').match(/([\d,]+(?:\.\d+)?)/);
+    if (!m) return;
+    const num = parseFloat(m[1].replace(/,/g, '')) || 0;
+    if ((it.currency || '').toUpperCase() === 'USD') usd += num;
+    else rmb += num;
+  });
+
+  return {
+    items,
+    notes,
+    total: { usd, rmb },
+    templateId: tpl ? tpl.id : '',
+    templateName: tpl ? tpl.name : '',
+  };
+}
+
 // ==================== 订舱口/服务商 ====================
 
 router.get('/suppliers', (req, res) => {
   try {
     const db = getDb();
-    const rows = db.prepare('SELECT * FROM shipping_rate_suppliers ORDER BY name').all();
+    const tf = tenantFilter(req.user, 'shipping_rate_suppliers');
+    const rows = db.prepare('SELECT * FROM shipping_rate_suppliers WHERE 1=1' + tf.sql + ' ORDER BY name').all(...tf.params);
     res.json({ success: true, data: rows });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -35,9 +183,9 @@ router.post('/suppliers', (req, res) => {
     const { name, contact_person, contact_phone, remark } = req.body;
     if (!name) return res.status(400).json({ success: false, error: '订舱口名称不能为空' });
     const stmt = db.prepare(
-      'INSERT INTO shipping_rate_suppliers (name, contact_person, contact_phone, remark, created_at) VALUES (?, ?, ?, ?, ?)'
+      'INSERT INTO shipping_rate_suppliers (name, contact_person, contact_phone, remark, tenant_id, created_at) VALUES (?, ?, ?, ?, ?, ?)'
     );
-    const result = stmt.run(name, contact_person || '', contact_phone || '', remark || '', new Date().toISOString());
+    const result = stmt.run(name, contact_person || '', contact_phone || '', remark || '', req.user?.tenant_id || null, new Date().toISOString());
     res.json({ success: true, data: { id: result.lastInsertRowid } });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -47,6 +195,11 @@ router.post('/suppliers', (req, res) => {
 router.delete('/suppliers/:id', (req, res) => {
   try {
     const db = getDb();
+    const row = db.prepare('SELECT * FROM shipping_rate_suppliers WHERE id = ?').get(req.params.id);
+    if (!row) return res.status(404).json({ success: false, error: '订舱口不存在' });
+    if (!isPlatformAdmin(req.user) && row.tenant_id !== (req.user.tenant_id || -1)) {
+      return res.status(404).json({ success: false, error: '订舱口不存在' });
+    }
     db.prepare('DELETE FROM shipping_rate_suppliers WHERE id = ?').run(req.params.id);
     res.json({ success: true });
   } catch (err) {
@@ -79,6 +232,9 @@ router.get('/batches', (req, res) => {
     if (vessel) { where += ' AND b.id IN (SELECT batch_id FROM shipping_rate_items WHERE vessel_voyage LIKE ?)'; params.push('%' + vessel + '%'); }
     if (validFrom) { where += ' AND b.valid_to >= ?'; params.push(validFrom); }
     if (validTo) { where += ' AND b.valid_from <= ?'; params.push(validTo); }
+    const tf = tenantFilter(req.user, 'b');
+    where += tf.sql;
+    params.push(...tf.params);
 
     const countRow = db.prepare('SELECT COUNT(*) as cnt FROM shipping_rate_batches b ' + where).get(...params);
     const batches = db.prepare(
@@ -106,6 +262,7 @@ router.get('/batches/:id', (req, res) => {
       'WHERE b.id = ?'
     ).get(req.params.id);
     if (!batch) return res.status(404).json({ success: false, error: '批次不存在' });
+    if (!canAccessBatch(req.user, batch)) return res.status(404).json({ success: false, error: '批次不存在' });
 
     const items = db.prepare(
       'SELECT * FROM shipping_rate_items WHERE batch_id = ? ORDER BY sort_order, id'
@@ -133,9 +290,9 @@ router.post('/batches', (req, res) => {
 
     const createBatch = db.transaction(() => {
       const batchResult = db.prepare(
-        'INSERT INTO shipping_rate_batches (pol, pod, container_type, valid_from, valid_to, notes, status, created_by, created_at, updated_at) ' +
-        "VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)"
-      ).run(pol, pod, container_type, valid_from, valid_to, notes || '', created_by, now, now);
+        'INSERT INTO shipping_rate_batches (pol, pod, container_type, valid_from, valid_to, notes, status, created_by, tenant_id, created_at, updated_at) ' +
+        "VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)"
+      ).run(pol, pod, container_type, valid_from, valid_to, notes || '', created_by, req.user?.tenant_id || null, now, now);
 
       const batchId = batchResult.lastInsertRowid;
       const insertItem = db.prepare(
@@ -165,6 +322,7 @@ router.put('/batches/:id', (req, res) => {
 
     const existing = db.prepare('SELECT * FROM shipping_rate_batches WHERE id = ?').get(batchId);
     if (!existing) return res.status(404).json({ success: false, error: '批次不存在' });
+    if (!canAccessBatch(req.user, existing)) return res.status(404).json({ success: false, error: '批次不存在' });
 
     const now = new Date().toISOString();
 
@@ -199,6 +357,9 @@ router.delete('/batches/:id', (req, res) => {
   try {
     const db = getDb();
     const batchId = parseInt(req.params.id);
+    const existing = db.prepare('SELECT * FROM shipping_rate_batches WHERE id = ?').get(batchId);
+    if (!existing) return res.status(404).json({ success: false, error: '批次不存在' });
+    if (!canAccessBatch(req.user, existing)) return res.status(404).json({ success: false, error: '批次不存在' });
     const del = db.transaction(() => {
       db.prepare('DELETE FROM shipping_rate_items WHERE batch_id = ?').run(batchId);
       db.prepare('DELETE FROM shipping_rate_batches WHERE id = ?').run(batchId);
@@ -221,6 +382,11 @@ router.post('/batches/batch-delete', (req, res) => {
       return res.status(400).json({ success: false, error: '单次最多删除100条' });
     }
     const placeholders = ids.map(() => '?').join(',');
+    const tf = tenantFilter(req.user, 'shipping_rate_batches');
+    const allowed = db.prepare('SELECT COUNT(*) as cnt FROM shipping_rate_batches WHERE id IN (' + placeholders + ')' + tf.sql).get(...ids, ...tf.params);
+    if (allowed.cnt !== ids.length) {
+      return res.status(403).json({ success: false, error: '包含无权操作的批次' });
+    }
     const del = db.transaction(() => {
       db.prepare('DELETE FROM shipping_rate_items WHERE batch_id IN (' + placeholders + ')').run(...ids);
       db.prepare('DELETE FROM shipping_rate_batches WHERE id IN (' + placeholders + ')').run(...ids);
@@ -239,6 +405,9 @@ router.put('/batches/:id/status', (req, res) => {
     if (!['active', 'expired'].includes(status)) {
       return res.status(400).json({ success: false, error: '状态值无效' });
     }
+    const existing = db.prepare('SELECT * FROM shipping_rate_batches WHERE id = ?').get(req.params.id);
+    if (!existing) return res.status(404).json({ success: false, error: '批次不存在' });
+    if (!canAccessBatch(req.user, existing)) return res.status(404).json({ success: false, error: '批次不存在' });
     db.prepare('UPDATE shipping_rate_batches SET status=?, updated_at=? WHERE id=?')
       .run(status, new Date().toISOString(), req.params.id);
     res.json({ success: true });
@@ -261,6 +430,11 @@ router.post('/batches/batch-status', (req, res) => {
       return res.status(400).json({ success: false, error: '单次最多操作200条' });
     }
     const placeholders = ids.map(() => '?').join(',');
+    const tf = tenantFilter(req.user, 'shipping_rate_batches');
+    const allowed = db.prepare('SELECT COUNT(*) as cnt FROM shipping_rate_batches WHERE id IN (' + placeholders + ')' + tf.sql).get(...ids, ...tf.params);
+    if (allowed.cnt !== ids.length) {
+      return res.status(403).json({ success: false, error: '包含无权操作的批次' });
+    }
     const now = new Date().toISOString();
     const result = db.prepare('UPDATE shipping_rate_batches SET status=?, updated_at=? WHERE id IN (' + placeholders + ')')
       .run(status, now, ...ids);
@@ -290,6 +464,9 @@ router.get('/active', (req, res) => {
     if (vessel) { where += ' AND b.id IN (SELECT batch_id FROM shipping_rate_items WHERE vessel_voyage LIKE ?)'; params.push('%' + vessel + '%'); }
     if (validFrom) { where += ' AND b.valid_to >= ?'; params.push(validFrom); }
     if (validTo) { where += ' AND b.valid_from <= ?'; params.push(validTo); }
+    const tf = tenantFilter(req.user, 'b');
+    where += tf.sql;
+    params.push(...tf.params);
 
     const batches = db.prepare(
       'SELECT b.*, u.name as created_by_name ' +
@@ -315,9 +492,10 @@ router.get('/active', (req, res) => {
 router.get('/filters', (req, res) => {
   try {
     const db = getDb();
-    const pols = db.prepare("SELECT DISTINCT pol FROM shipping_rate_batches WHERE status='active' ORDER BY pol").all();
-    const pods = db.prepare("SELECT DISTINCT pod FROM shipping_rate_batches WHERE status='active' ORDER BY pod").all();
-    const types = db.prepare("SELECT DISTINCT container_type FROM shipping_rate_batches WHERE status='active' ORDER BY container_type").all();
+    const tf = tenantFilter(req.user, 'shipping_rate_batches');
+    const pols = db.prepare("SELECT DISTINCT pol FROM shipping_rate_batches WHERE status='active'" + tf.sql + ' ORDER BY pol').all(...tf.params);
+    const pods = db.prepare("SELECT DISTINCT pod FROM shipping_rate_batches WHERE status='active'" + tf.sql + ' ORDER BY pod').all(...tf.params);
+    const types = db.prepare("SELECT DISTINCT container_type FROM shipping_rate_batches WHERE status='active'" + tf.sql + ' ORDER BY container_type').all(...tf.params);
     res.json({
       success: true,
       data: {
@@ -388,9 +566,9 @@ router.post('/import', upload.single('file'), (req, res) => {
         };
 
         const batchResult = db.prepare(
-          "INSERT INTO shipping_rate_batches (pol, pod, container_type, valid_from, valid_to, notes, status, created_by, created_at, updated_at) " +
-          "VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)"
-        ).run(batchVals.pol, batchVals.pod, batchVals.container_type, batchVals.valid_from, batchVals.valid_to, batchVals.notes, created_by, now, now);
+          "INSERT INTO shipping_rate_batches (pol, pod, container_type, valid_from, valid_to, notes, status, created_by, tenant_id, created_at, updated_at) " +
+          "VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)"
+        ).run(batchVals.pol, batchVals.pod, batchVals.container_type, batchVals.valid_from, batchVals.valid_to, batchVals.notes, created_by, req.user?.tenant_id || null, now, now);
 
         const batchId = batchResult.lastInsertRowid;
         const insertItem = db.prepare(
@@ -437,6 +615,7 @@ router.get('/batches/:id/export', (req, res) => {
     const db = getDb();
     const batch = db.prepare('SELECT * FROM shipping_rate_batches WHERE id = ?').get(req.params.id);
     if (!batch) return res.status(404).json({ success: false, error: '批次不存在' });
+    if (!canAccessBatch(req.user, batch)) return res.status(404).json({ success: false, error: '批次不存在' });
 
     const items = db.prepare(
       'SELECT * FROM shipping_rate_items WHERE batch_id = ? ORDER BY sort_order, id'
@@ -504,6 +683,7 @@ router.get('/batches/:id/quotation', (req, res) => {
     const db = getDb();
     const batch = db.prepare('SELECT * FROM shipping_rate_batches WHERE id = ?').get(req.params.id);
     if (!batch) return res.status(404).json({ success: false, error: '批次不存在' });
+    if (!canAccessBatch(req.user, batch)) return res.status(404).json({ success: false, error: '批次不存在' });
 
     var itemId = req.query.item_id;
     var item;
@@ -535,24 +715,34 @@ router.get('/batches/:id/quotation', (req, res) => {
 
     var aoa = [];
 
+    var built = buildQuotation(db, {
+      pol: pol,
+      pod: pod,
+      freight: freight,
+      templateId: req.query.template_id,
+      user: req.user,
+    });
+
     aoa.push(['']);
+    var headerRow = aoa.length;
     aoa.push(['费用项目', '计费标准', '费用金额', '备注']);
-    aoa.push(['基础海运费（' + pol + '-->' + pod + '）', '按每柜计费', 'USD ' + freight + ' /柜（含AMS+换单费）', '主运输核心费用\n根据当日实际价格']);
-    aoa.push(['港口本地杂费（THC+DOC+EBS等）', '按每柜计费', 'RMB 2500 /柜', '预提费（提前用箱）\n过夜费（装柜要过晚上12点）\n待时费（装柜时间超过8小时）\n落箱费（码头没有开港，找堆场存放）\n预进港（码头没有开港，找黄牛放进港口）\n错截费（船司已经截单资料，柜子没装好）+改单费\n加载费（船司甩柜后，加钱找黄牛上船）\n跑空费（通知柜子已卸空，实际车队提空柜时海外仓未卸空）\n滞箱费（柜子在海外仓时间过长，一般为提出后7天）\n车架费用（柜子车架的使用费用，一般免费3天）']);
-    aoa.push(['关税', '按每柜计费', 'USD 2000 /柜', '必缴费用']);
-    aoa.push(['清关手续费', '按每柜计费', 'USD 220 /柜', '必缴费用']);
-    aoa.push(['报关费', '按每柜计费', 'RMB 350 /票', '常规普货报关，不含特殊单证报关']);
-    aoa.push(['拖车提柜费（工厂->码头）', '按每柜计费', 'RMB 2600 /柜', '如需自提可不收取，也可根据不同的路程对应收取']);
-    aoa.push(['尾程派送', '按每柜计费', 'USD 800 /柜', '如需自提可不收取']);
-    aoa.push(['查验风险金', '按每柜计费', 'USD 0 /柜', '加收100USD抵扣1000，依次类推（如遇到查验）']);
-    aoa.push(['合计费用', '一票总计', 'USD ' + (freight + 2000 + 220 + 800) + ' + RMB ' + (2500 + 350 + 2600), '']);
+    var itemStartRow = aoa.length;
+    built.items.forEach(function(it) {
+      aoa.push([it.name, it.standard, it.amount, it.note]);
+    });
+    var itemEndRow = aoa.length - 1;
+    var totalRow = aoa.length;
+    aoa.push(['合计费用', '一票总计', 'USD ' + built.total.usd.toLocaleString() + ' + RMB ' + built.total.rmb.toLocaleString(), '']);
     aoa.push(['']);
+    var sectionRow = aoa.length;
     aoa.push(['尾程派送注意事项']);
+    var noteHeaderRow = aoa.length;
     aoa.push(['费用项目', '免费期', '超期标准', '备注']);
-    aoa.push(['车架费', '3天', '约45USD/天', '自柜子抵达仓库完成卸柜起计算，至空柜归还船公司为止']);
-    aoa.push(['预提费', '—', '约200USD/次', '双方确认送仓时间后，若车队已完成港口提柜，因海外仓侧原因无法接收柜子入仓，将产生额外预提费用，该费用按实际发生向客户收取']);
-    aoa.push(['夜存费', '—', '约50USD/天', '柜子从港口提柜出来后，未能直接送仓，需在堆场/车场临时过夜暂存所产生的费用，按实际发生收取']);
-    aoa.push(['改地址/改派送方式', '需提前7天', '可能产生约100USD改单费', '客户变更需提前沟通（如更改地址或者改自提）']);
+    var noteStartRow = aoa.length;
+    built.notes.forEach(function(n) {
+      aoa.push([n.name, n.free, n.fee, n.note]);
+    });
+    var noteEndRow = aoa.length - 1;
 
     var ws = XLSX.utils.aoa_to_sheet(aoa);
 
@@ -565,35 +755,45 @@ router.get('/batches/:id/quotation', (req, res) => {
 
     ws['!rows'] = [];
     for (var ri = 0; ri < aoa.length; ri++) {
-      ws['!rows'][ri] = { hpt: ri === 3 ? 120 : (ri === 12 ? 25 : 22) };
+      ws['!rows'][ri] = { hpt: 22 };
     }
+    ws['!rows'][headerRow] = { hpt: 25 };
+    ws['!rows'][noteHeaderRow] = { hpt: 22 };
+    ws['!rows'][sectionRow] = { hpt: 25 };
+    ws['!rows'][totalRow] = { hpt: 25 };
+    built.items.forEach(function(it, idx) {
+      ws['!rows'][itemStartRow + idx] = { hpt: String(it.note || '').length > 100 ? 120 : 22 };
+    });
 
     var setCellStyle = function(cell, style) { if (cell) cell.s = style; };
 
     for (var ci = 0; ci <= 3; ci++) {
-      setCellStyle(ws[XLSX.utils.encode_cell({ r: 1, c: ci })], headerStyle);
+      setCellStyle(ws[XLSX.utils.encode_cell({ r: headerRow, c: ci })], headerStyle);
     }
     for (ci = 0; ci <= 3; ci++) {
-      setCellStyle(ws[XLSX.utils.encode_cell({ r: 12, c: ci })], sectionStyle);
+      setCellStyle(ws[XLSX.utils.encode_cell({ r: sectionRow, c: ci })], sectionStyle);
     }
     for (ci = 0; ci <= 3; ci++) {
-      setCellStyle(ws[XLSX.utils.encode_cell({ r: 11, c: ci })], totalStyle);
+      setCellStyle(ws[XLSX.utils.encode_cell({ r: noteHeaderRow, c: ci })], sectionStyle);
+    }
+    for (ci = 0; ci <= 3; ci++) {
+      setCellStyle(ws[XLSX.utils.encode_cell({ r: totalRow, c: ci })], totalStyle);
     }
 
-    for (var row = 2; row <= 10; row++) {
+    for (var row = itemStartRow; row <= itemEndRow; row++) {
       for (var col = 0; col <= 3; col++) {
         setCellStyle(ws[XLSX.utils.encode_cell({ r: row, c: col })], cellStyle);
       }
     }
-    for (var row2 = 13; row2 <= 17; row2++) {
+    for (var row2 = noteStartRow; row2 <= noteEndRow; row2++) {
       for (var col2 = 0; col2 <= 3; col2++) {
         setCellStyle(ws[XLSX.utils.encode_cell({ r: row2, c: col2 })], cellStyle);
       }
     }
 
     ws['!merges'] = [
-      { s: { r: 1, c: 0 }, e: { r: 1, c: 3 } },
-      { s: { r: 12, c: 0 }, e: { r: 12, c: 3 } },
+      { s: { r: headerRow, c: 0 }, e: { r: headerRow, c: 3 } },
+      { s: { r: sectionRow, c: 0 }, e: { r: sectionRow, c: 3 } },
     ];
 
     var wb = XLSX.utils.book_new();
@@ -614,6 +814,7 @@ router.get('/batches/:id/quotation-preview', (req, res) => {
     const db = getDb();
     const batch = db.prepare('SELECT * FROM shipping_rate_batches WHERE id = ?').get(req.params.id);
     if (!batch) return res.status(404).json({ success: false, error: '批次不存在' });
+    if (!canAccessBatch(req.user, batch)) return res.status(404).json({ success: false, error: '批次不存在' });
 
     var itemId = req.query.item_id;
     var templateId = req.query.template_id;
@@ -635,93 +836,28 @@ router.get('/batches/:id/quotation-preview', (req, res) => {
     var carrier = item.carrier_name || '';
     var freight = item.freight_rate || 0;
 
-    // 尝试从模板加载费项
-    var templateItems = null;
-    var templateNotes = null;
-    if (templateId) {
-      var tpl = db.prepare('SELECT * FROM fee_templates WHERE id = ?').get(templateId);
-      if (tpl) {
-        var tplItems = db.prepare('SELECT * FROM fee_template_items WHERE template_id = ? AND category = ? ORDER BY sort_order, id').all(templateId, 'fee');
-        var tplNotes = db.prepare('SELECT * FROM fee_template_items WHERE template_id = ? AND category = ? ORDER BY sort_order, id').all(templateId, 'note');
-        if (tplItems.length > 0) {
-          templateItems = tplItems.map(ti => {
-            var amount = ti.amount_value;
-            if (ti.amount_type === 'freight') {
-              amount = (ti.currency || 'USD') + ' ' + freight + ' /柜';
-            }
-            return {
-              name: ti.item_name,
-              standard: ti.standard || '按每柜计费',
-              amount: amount || '-',
-              note: ti.note || '',
-              currency: ti.currency || 'USD',
-              amount_type: ti.amount_type
-            };
-          });
-        }
-        if (tplNotes.length > 0) {
-          templateNotes = tplNotes.map(tn => ({
-            name: tn.item_name,
-            free: tn.standard || '—',
-            fee: tn.amount_value || '—',
-            note: tn.note || ''
-          }));
-        }
-      }
-    }
-
-    // 没有模板则用默认硬编码
-    if (!templateItems) {
-      templateItems = [
-        { name: '基础海运费（' + pol + '-->' + pod + '）', standard: '按每柜计费', amount: 'USD ' + freight + ' /柜（含AMS+换单费）', note: '主运输核心费用\n根据当日实际价格', currency: 'USD', amount_type: 'freight' },
-        { name: '港口本地杂费（THC+DOC+EBS等）', standard: '按每柜计费', amount: 'RMB 2500 /柜', note: '预提费（提前用箱）、过夜费（装柜要过晚上12点）、待时费（装柜时间超过8小时）、落箱费（码头没有开港，找堆场存放）、预进港（码头没有开港，找黄牛放进港口）、错截费+改单费、加载费、跑空费、滞箱费、车架费用', currency: 'RMB', amount_type: 'fixed' },
-        { name: '关税', standard: '按每柜计费', amount: 'USD 2000 /柜', note: '必缴费用', currency: 'USD', amount_type: 'fixed' },
-        { name: '清关手续费', standard: '按每柜计费', amount: 'USD 220 /柜', note: '必缴费用', currency: 'USD', amount_type: 'fixed' },
-        { name: '报关费', standard: '按每柜计费', amount: 'RMB 350 /票', note: '常规普货报关，不含特殊单证报关', currency: 'RMB', amount_type: 'fixed' },
-        { name: '拖车提柜费（工厂->码头）', standard: '按每柜计费', amount: 'RMB 2600 /柜', note: '如需自提可不收取，也可根据不同的路程对应收取', currency: 'RMB', amount_type: 'fixed' },
-        { name: '尾程派送', standard: '按每柜计费', amount: 'USD 800 /柜', note: '如需自提可不收取', currency: 'USD', amount_type: 'fixed' },
-        { name: '查验风险金', standard: '按每柜计费', amount: 'USD 0 /柜', note: '加收100USD抵扣1000，依次类推（如遇到查验）', currency: 'USD', amount_type: 'fixed' },
-      ];
-    }
-
-    if (!templateNotes) {
-      templateNotes = [
-        { name: '车架费', free: '3天', fee: '约45USD/天', note: '自柜子抵达仓库完成卸柜起计算，至空柜归还船公司为止' },
-        { name: '预提费', free: '—', fee: '约200USD/次', note: '双方确认送仓时间后，若车队已完成港口提柜，因海外仓侧原因无法接收柜子入仓，将产生额外预提费用，该费用按实际发生向客户收取' },
-        { name: '夜存费', free: '—', fee: '约50USD/天', note: '柜子从港口提柜出来后，未能直接送仓，需在堆场/车场临时过夜暂存所产生的费用，按实际发生收取' },
-        { name: '改地址/改派送方式', free: '需提前7天', fee: '可能产生约100USD改单费', note: '客户变更需提前沟通（如更改地址或者改自提）' },
-      ];
-    }
-
-    // 汇总计算
-    var usdTotal = 0;
-    var rmbTotal = 0;
-    templateItems.forEach(function(ti) {
-      var amt = ti.amount || '';
-      var numMatch = amt.match(/([\d,]+)/);
-      if (numMatch) {
-        var num = parseFloat(numMatch[1].replace(/,/g, '')) || 0;
-        if (amt.toUpperCase().includes('USD') || ti.currency === 'USD') {
-          usdTotal += num;
-        } else {
-          rmbTotal += num;
-        }
-      }
+    var built = buildQuotation(db, {
+      pol: pol,
+      pod: pod,
+      freight: freight,
+      templateId: templateId,
+      user: req.user,
     });
 
     var data = {
       _batchId: req.params.id,
       _itemId: itemId || '',
-      _templateId: templateId || '',
+      _templateId: built.templateId,
+      template_name: built.templateName,
       pol: pol,
       pod: pod,
       ct: ct,
       carrier: carrier,
       vessel: item.vessel_voyage || '',
       freight: freight,
-      items: templateItems,
-      total: { usd: usdTotal, rmb: rmbTotal },
-      notes: templateNotes
+      items: built.items,
+      total: built.total,
+      notes: built.notes
     };
 
     res.json({ success: true, data: data });
@@ -756,6 +892,9 @@ router.get('/details', (req, res) => {
     if (vessel) { where += ' AND i.vessel_voyage LIKE ?'; params.push('%' + vessel + '%'); }
     if (validFrom) { where += ' AND b.valid_to >= ?'; params.push(validFrom); }
     if (validTo) { where += ' AND b.valid_from <= ?'; params.push(validTo); }
+    const tf = tenantFilter(req.user, 'b');
+    where += tf.sql;
+    params.push(...tf.params);
 
     const countRow = db.prepare(
       'SELECT COUNT(*) as cnt FROM shipping_rate_items i JOIN shipping_rate_batches b ON i.batch_id = b.id ' + where
@@ -781,6 +920,8 @@ router.put('/details/:id', (req, res) => {
     const id = parseInt(req.params.id);
     const item = db.prepare('SELECT * FROM shipping_rate_items WHERE id = ?').get(id);
     if (!item) return res.status(404).json({ success: false, error: '明细不存在' });
+    const batch = db.prepare('SELECT * FROM shipping_rate_batches WHERE id = ?').get(item.batch_id);
+    if (!canAccessBatch(req.user, batch)) return res.status(404).json({ success: false, error: '明细不存在' });
 
     const { carrier_name, vessel_voyage, freight_rate, cost_freight, transit_days, supplier_name, supplier_contact, remarks } = req.body;
 

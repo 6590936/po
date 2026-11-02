@@ -575,9 +575,10 @@ function ShippingRates() {
       message.loading({ content: '正在生成报价单...', key: 'download', duration: 0 });
 
       const token = useAuthStore.getState().token;
+      const tplId = previewData?._templateId;
       const url = itemId
-        ? `/api/shipping-rates/batches/${batchId}/quotation?item_id=${itemId}`
-        : `/api/shipping-rates/batches/${batchId}/quotation`;
+        ? `/api/shipping-rates/batches/${batchId}/quotation?item_id=${itemId}${tplId ? `&template_id=${tplId}` : ''}`
+        : `/api/shipping-rates/batches/${batchId}/quotation${tplId ? `?template_id=${tplId}` : ''}`;
 
       console.log('请求 URL:', url);
 
@@ -1415,6 +1416,9 @@ function ShippingRates() {
           <div style={{ textAlign: 'center', padding: 60 }}><Text>加载中...</Text></div>
         ) : previewData ? (
           <div id="quotation-preview" style={{ background: '#fff' }}>
+            <div style={{ marginBottom: 12, padding: '8px 20px', background: '#fafafa', border: '1px solid #e8e8e8', borderRadius: 6, fontSize: 12, color: '#595959' }}>
+              费用模版：<Text strong style={{ color: previewData.template_name ? '#cf1322' : '#999' }}>{previewData.template_name || '未匹配到模版（使用默认费项）'}</Text>
+            </div>
             <div style={{ marginBottom: 16, padding: '12px 20px', background: '#1F4E79', color: '#fff', borderRadius: 6, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
               <Text strong style={{ fontSize: 15, color: '#fff' }}>费用明细</Text>
               <Text style={{ color: '#FFD700', fontSize: 12 }}>说明：报价根据实际询价，关根据客户的产品名最终确认</Text>

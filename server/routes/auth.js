@@ -5,6 +5,7 @@ import bcrypt from 'bcryptjs';
 import { UserOps, RoleOps, TenantOps, getDb } from '../database.js';
 import { logAudit } from '../logger.js';
 import { signClientToken, toClientProfile } from './client.js';
+import { PLATFORM_ONLY_MENUS, PLATFORM_ONLY_PERMISSIONS } from '../utils/scope.js';
 
 const router = express.Router();
 const JWT_SECRET = process.env.JWT_SECRET || 'meiou-crm-secret-key-2024';
@@ -18,9 +19,22 @@ function issueStaffSession(user) {
   let permissions = RoleOps.getUserPermissions(user.role_id);
   let menus = RoleOps.getUserMenus(user.role_id);
 
+  const isPlatformAccount = !user.tenant_id && user.role === 'admin';
+
   if (!menus.length && user.role === 'admin') {
-    permissions = ['data:all', 'system:platform', 'shipping:active', 'shipping:batches', 'shipping:detail'];
-    menus = ['/', '/customers', '/shipping-rates', '/fee-templates', '/wechat', '/sales', '/admin'];
+    if (isPlatformAccount) {
+      permissions = ['data:all', 'system:platform', 'shipping:active', 'shipping:batches', 'shipping:detail'];
+      menus = ['/', '/customers', '/shipping-rates', '/fee-templates', '/yunwuyun', '/wechat', '/sales', '/admin'];
+    } else {
+      permissions = ['data:tenant', 'system:tenant_admin', 'shipping:active', 'shipping:batches', 'shipping:detail'];
+      menus = ['/', '/customers', '/shipping-rates', '/fee-templates', '/sales', '/admin'];
+    }
+  }
+
+  // 非平台账号一律剔除平台专属菜单与权限，防止越权
+  if (!isPlatformAccount) {
+    menus = menus.filter(m => !PLATFORM_ONLY_MENUS.includes(m));
+    permissions = permissions.filter(p => !PLATFORM_ONLY_PERMISSIONS.includes(p));
   }
 
   const token = jwt.sign(
@@ -150,6 +164,22 @@ router.post('/unified-login', (req, res) => {
 router.get('/me', authenticateToken, (req, res) => {
   const user = UserOps.findById(req.user.id);
   if (!user) return res.status(404).json({ error: '用户不存在' });
+  const platformAccount = !user.tenant_id && user.role === 'admin';
+  let menus = RoleOps.getUserMenus(user.role_id);
+  let permissions = RoleOps.getUserPermissions(user.role_id);
+  if (!menus.length && user.role === 'admin') {
+    if (platformAccount) {
+      permissions = ['data:all', 'system:platform', 'shipping:active', 'shipping:batches', 'shipping:detail'];
+      menus = ['/', '/customers', '/shipping-rates', '/fee-templates', '/yunwuyun', '/wechat', '/sales', '/admin'];
+    } else {
+      permissions = ['data:tenant', 'system:tenant_admin', 'shipping:active', 'shipping:batches', 'shipping:detail'];
+      menus = ['/', '/customers', '/shipping-rates', '/fee-templates', '/sales', '/admin'];
+    }
+  }
+  if (!platformAccount) {
+    menus = menus.filter(m => !PLATFORM_ONLY_MENUS.includes(m));
+    permissions = permissions.filter(p => !PLATFORM_ONLY_PERMISSIONS.includes(p));
+  }
   res.json({
     id: user.id,
     username: user.username,
@@ -159,8 +189,8 @@ router.get('/me', authenticateToken, (req, res) => {
     tenant_id: user.tenant_id,
     tenant_name: user.tenant_name,
     created_at: user.created_at,
-    menus: (() => { const m = RoleOps.getUserMenus(user.role_id); return (!m.length && user.role === 'admin') ? ['/', '/customers', '/shipping-rates', '/fee-templates', '/wechat', '/sales', '/admin'] : m; })(),
-    permissions: (() => { const p = RoleOps.getUserPermissions(user.role_id); return (!p.length && user.role === 'admin') ? ['data:all', 'system:platform', 'shipping:active', 'shipping:batches', 'shipping:detail'] : p; })(),
+    menus,
+    permissions,
   });
 });
 
@@ -368,9 +398,19 @@ router.post('/wechat-login', async (req, res) => {
 
     let permissions2 = RoleOps.getUserPermissions(user.role_id);
     let menus2 = RoleOps.getUserMenus(user.role_id);
+    const platformAccount2 = !user.tenant_id && user.role === 'admin';
     if (!menus2.length && user.role === 'admin') {
-      permissions2 = ['data:all', 'system:platform', 'shipping:active', 'shipping:batches', 'shipping:detail'];
-      menus2 = ['/', '/customers', '/shipping-rates', '/fee-templates', '/wechat', '/sales', '/admin'];
+      if (platformAccount2) {
+        permissions2 = ['data:all', 'system:platform', 'shipping:active', 'shipping:batches', 'shipping:detail'];
+        menus2 = ['/', '/customers', '/shipping-rates', '/fee-templates', '/yunwuyun', '/wechat', '/sales', '/admin'];
+      } else {
+        permissions2 = ['data:tenant', 'system:tenant_admin', 'shipping:active', 'shipping:batches', 'shipping:detail'];
+        menus2 = ['/', '/customers', '/shipping-rates', '/fee-templates', '/sales', '/admin'];
+      }
+    }
+    if (!platformAccount2) {
+      menus2 = menus2.filter(m => !PLATFORM_ONLY_MENUS.includes(m));
+      permissions2 = permissions2.filter(p => !PLATFORM_ONLY_PERMISSIONS.includes(p));
     }
 
     const token = jwt.sign(
@@ -448,10 +488,12 @@ export function authenticateToken(req, res, next) {
   }
 }
 
-// 管理员权限中间件
+// 管理员权限中间件（平台管理员或本主体管理员）
 export function requireAdmin(req, res, next) {
   const perms = req.user.permissions || [];
-  const isAdmin = req.user.role === 'admin' || perms.includes('data:all') || perms.includes('system:platform');
+  const isAdmin = req.user.role === 'admin'
+    || perms.includes('system:tenant_admin')
+    || (!req.user.tenant_id && perms.includes('system:platform'));
   if (!isAdmin) return res.status(403).json({ error: '需要管理员权限' });
   next();
 }
