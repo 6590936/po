@@ -842,10 +842,13 @@ function runTenantMigration() {
     'daily_activities', 'quotes', 'weekly_reports', 'call_logs', 'feedback_summaries',
     'shipping_rate_batches', 'shipping_rate_suppliers', 'fee_templates',
     'sales_materials', 'sales_scripts', 'onboarding_plans', 'user_onboarding',
+    'yunwuyun_orders', 'yunwuyun_customers',
   ];
   for (const table of tenantTables) {
     ensureColumn(table, 'tenant_id', 'INTEGER REFERENCES tenants(id)');
   }
+  try { db.exec('CREATE INDEX IF NOT EXISTS idx_yy_orders_tenant ON yunwuyun_orders(tenant_id)'); } catch (_) {}
+  try { db.exec('CREATE INDEX IF NOT EXISTS idx_yy_customers_tenant ON yunwuyun_customers(tenant_id)'); } catch (_) {}
   for (const table of ['daily_activities', 'quotes', 'weekly_reports', 'call_logs', 'feedback_summaries']) {
     try {
       db.prepare(
@@ -860,6 +863,13 @@ function runTenantMigration() {
       "UPDATE shipping_rate_batches SET tenant_id = COALESCE((SELECT u.tenant_id FROM users u WHERE u.id = shipping_rate_batches.created_by), ?) WHERE tenant_id IS NULL"
     ).run(legacyTenantId);
     db.prepare('UPDATE shipping_rate_suppliers SET tenant_id = ? WHERE tenant_id IS NULL').run(legacyTenantId);
+  } catch (_) {}
+
+  // FMS 同步的订单/客户数据来源于美鸥主公司的 FMS 账号，存量数据统一归属美鸥主公司主体，
+  // 其他主体账号不可见，平台管理员仍可查看全部
+  try {
+    db.prepare('UPDATE yunwuyun_orders SET tenant_id = ? WHERE tenant_id IS NULL').run(tenantId);
+    db.prepare('UPDATE yunwuyun_customers SET tenant_id = ? WHERE tenant_id IS NULL').run(tenantId);
   } catch (_) {}
 
   // 费用模版历史数据按创建人归属主体；创建人无主体（平台管理员）的模版保持 tenant_id 为空，

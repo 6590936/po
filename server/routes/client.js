@@ -18,6 +18,7 @@ export function signClientToken(customer) {
       client_code: customer.client_code,
       client_name: customer.client_name,
       login_account: customer.login_account || customer.client_code,
+      tenant_id: customer.tenant_id,
       type: 'client',
     },
     JWT_SECRET,
@@ -34,6 +35,7 @@ export function toClientProfile(customer) {
     client_name_eng: customer.client_name_eng,
     client_abbr: customer.client_abbr,
     login_account: customer.login_account || customer.client_code,
+    tenant_id: customer.tenant_id,
   };
 }
 
@@ -282,9 +284,14 @@ router.get('/stats', authenticateClient, (req, res) => {
 router.get('/shipping-rates/filters', authenticateClient, (req, res) => {
   try {
     const db = getDb();
-    const pols = db.prepare("SELECT DISTINCT pol FROM shipping_rate_batches WHERE status='active' AND valid_from <= date('now','localtime') AND valid_to >= date('now','localtime') ORDER BY pol").all();
-    const pods = db.prepare("SELECT DISTINCT pod FROM shipping_rate_batches WHERE status='active' AND valid_from <= date('now','localtime') AND valid_to >= date('now','localtime') ORDER BY pod").all();
-    const types = db.prepare("SELECT DISTINCT container_type FROM shipping_rate_batches WHERE status='active' AND valid_from <= date('now','localtime') AND valid_to >= date('now','localtime') ORDER BY container_type").all();
+    const tid = req.client.tenant_id;
+    const baseWhere = "status='active' AND valid_from <= date('now','localtime') AND valid_to >= date('now','localtime')";
+    const tenantWhere = tid ? ` AND tenant_id = ?` : '';
+    const tParams = tid ? [tid] : [];
+
+    const pols = db.prepare(`SELECT DISTINCT pol FROM shipping_rate_batches WHERE ${baseWhere}${tenantWhere} ORDER BY pol`).all(...tParams);
+    const pods = db.prepare(`SELECT DISTINCT pod FROM shipping_rate_batches WHERE ${baseWhere}${tenantWhere} ORDER BY pod`).all(...tParams);
+    const types = db.prepare(`SELECT DISTINCT container_type FROM shipping_rate_batches WHERE ${baseWhere}${tenantWhere} ORDER BY container_type`).all(...tParams);
     res.json({ success: true, data: { pols: pols.map(r => r.pol), pods: pods.map(r => r.pod), container_types: types.map(r => r.container_type) } });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -297,6 +304,10 @@ router.get('/shipping-rates/batches/:id/quotation-preview', authenticateClient, 
     const db = getDb();
     const batch = db.prepare('SELECT * FROM shipping_rate_batches WHERE id = ?').get(req.params.id);
     if (!batch) return res.status(404).json({ success: false, error: '批次不存在' });
+    const tid = req.client.tenant_id;
+    if (tid && batch.tenant_id !== tid) {
+      return res.status(404).json({ success: false, error: '批次不存在' });
+    }
 
     var itemId = req.query.item_id;
     var item;
@@ -436,6 +447,10 @@ router.get('/shipping-rates/batches/:id/quotation', authenticateClient, (req, re
     const db = getDb();
     const batch = db.prepare('SELECT * FROM shipping_rate_batches WHERE id = ?').get(req.params.id);
     if (!batch) return res.status(404).json({ success: false, error: '批次不存在' });
+    const tid = req.client.tenant_id;
+    if (tid && batch.tenant_id !== tid) {
+      return res.status(404).json({ success: false, error: '批次不存在' });
+    }
 
     var itemId = req.query.item_id;
     var item;
@@ -584,9 +599,11 @@ router.get('/shipping-rates', authenticateClient, (req, res) => {
     const pol = req.query.pol || '';
     const pod = req.query.pod || '';
     const container_type = req.query.container_type || '';
+    const tid = req.client.tenant_id;
 
     let where = "WHERE b.status = 'active' AND b.valid_from <= date('now','localtime') AND b.valid_to >= date('now','localtime')";
     const params = [];
+    if (tid) { where += ' AND b.tenant_id = ?'; params.push(tid); }
     if (pol) { where += ' AND b.pol = ?'; params.push(pol); }
     if (pod) { where += ' AND b.pod = ?'; params.push(pod); }
     if (container_type) { where += ' AND b.container_type = ?'; params.push(container_type); }

@@ -4,14 +4,64 @@ import bcrypt from 'bcryptjs';
 import { authenticateToken } from './auth.js';
 import { testConnection, setToken, cntProfitTotal, query, syncOrders, syncCustomers, syncOrderSettlements } from '../yunwuyun.js';
 import { getDb } from '../database.js';
+import { tenantScope, isAdminUser } from '../utils/scope.js';
 
 const router = express.Router();
 
 router.use(authenticateToken);
 
+// 非管理员（销售）只能看到分配给自己的数据
 function isSales(req) {
-  const perms = req.user.permissions || [];
-  return req.user.role !== 'admin' && !perms.includes('data:all');
+  return !isAdminUser(req.user);
+}
+
+// FMS 同步数据归属主体：美鸥主公司（不存在时回落到存量用户最多的主体）
+function fmsTenantId(db) {
+  const row = db.prepare("SELECT id FROM tenants WHERE name = '美鸥主公司'").get();
+  if (row) return row.id;
+  const legacy = db.prepare(
+    'SELECT tenant_id, COUNT(*) AS cnt FROM users WHERE tenant_id IS NOT NULL GROUP BY tenant_id ORDER BY cnt DESC LIMIT 1'
+  ).get();
+  return legacy ? legacy.tenant_id : null;
+}
+
+// 主体过滤条件：平台管理员不过滤，主体管理员仅本主体
+function tenantClause(user, alias = '') {
+  const scope = tenantScope(user);
+  if (scope === undefined) return { sql: '', params: [] };
+  return { sql: ` AND ${alias ? `${alias}.` : ''}tenant_id = ?`, params: [scope] };
+}
+
+// 销售过滤条件：只认分配给自己的客户，不受主体限制（分配关系即授权）
+function salesCustomerClause(user) {
+  return { sql: ' AND sales_name = ?', params: [user.name || ''] };
+}
+
+function salesOrderClause(user, alias = 'o') {
+  return {
+    sql: ` AND ${alias}.client_id IN (SELECT client_id FROM yunwuyun_customers WHERE sales_name = ?)`,
+    params: [user.name || ''],
+  };
+}
+
+// 单条记录访问校验：管理员按主体，销售按分配关系
+function canAccessCustomer(user, customer) {
+  if (!customer) return false;
+  if (isAdminUser(user)) {
+    const scope = tenantScope(user);
+    return scope === undefined || customer.tenant_id === scope;
+  }
+  return customer.sales_name === user.name;
+}
+
+function canAccessOrder(db, user, order) {
+  if (!order) return false;
+  if (isAdminUser(user)) {
+    const scope = tenantScope(user);
+    return scope === undefined || order.tenant_id === scope;
+  }
+  return !!db.prepare('SELECT client_id FROM yunwuyun_customers WHERE client_id = ? AND sales_name = ?')
+    .get(order.client_id, user.name);
 }
 
 // 测试连接
@@ -43,6 +93,7 @@ router.post('/sync-orders', async (req, res) => {
     }
 
     const db = getDb();
+    const fmsTenant = fmsTenantId(db);
     const upsert = db.prepare(`
       INSERT OR REPLACE INTO yunwuyun_orders (
         job_id, job_no, job_type, job_date, order_status, close_status,
@@ -62,7 +113,7 @@ router.post('/sync-orders', async (req, res) => {
         order_change_type, delivery_fee_cc, client_settler_type,
         ar_count, ap_count, latest_problem_count, comment_count,
         ar_settled_amt, ar_unsettled_amt, ap_settled_amt, ap_unsettled_amt, ar_amt_cy, ap_amt_cy, settled_at,
-        synced_at
+        tenant_id, synced_at
       ) VALUES (
         @job_id, @job_no, @job_type, @job_date, @order_status, @close_status,
         @client_id, @client_name, @client_name_eng, @client_code, @client_abbr,
@@ -81,7 +132,7 @@ router.post('/sync-orders', async (req, res) => {
         @order_change_type, @delivery_fee_cc, @client_settler_type,
         @ar_count, @ap_count, @latest_problem_count, @comment_count,
         @ar_settled_amt, @ar_unsettled_amt, @ap_settled_amt, @ap_unsettled_amt, @ar_amt_cy, @ap_amt_cy, @settled_at,
-        @synced_at
+        @tenant_id, @synced_at
       )
     `);
 
@@ -101,6 +152,7 @@ router.post('/sync-orders', async (req, res) => {
           ar_amt_cy: s.ar_amt_cy || 0,
           ap_amt_cy: s.ap_amt_cy || 0,
           settled_at: settleResult.success ? settleAt : null,
+          tenant_id: fmsTenant,
         });
       }
     });
@@ -167,6 +219,7 @@ router.post('/sync-customers', async (req, res) => {
     }
 
     const db = getDb();
+    const fmsTenant = fmsTenantId(db);
     // 使用 ON CONFLICT 局部更新：只覆盖 FMS 同步字段，保留客户登录账号/密码、费用模版、营业执照等本系统维护字段
     const upsert = db.prepare(`
       INSERT INTO yunwuyun_customers (
@@ -179,7 +232,7 @@ router.post('/sync-customers', async (req, res) => {
         inuse, catalog_name, catalog_name_eng,
         org_code, org_name, org_name_eng,
         client_source_name, client_source_name_eng, settler_type, csm_staff,
-        synced_at
+        tenant_id, synced_at
       ) VALUES (
         @client_id, @client_code, @client_name, @client_name_eng, @client_abbr,
         @client_type, @client_class, @client_class_eng, @client_property, @client_same_industry,
@@ -190,7 +243,7 @@ router.post('/sync-customers', async (req, res) => {
         @inuse, @catalog_name, @catalog_name_eng,
         @org_code, @org_name, @org_name_eng,
         @client_source_name, @client_source_name_eng, @settler_type, @csm_staff,
-        @synced_at
+        @tenant_id, @synced_at
       )
       ON CONFLICT(client_id) DO UPDATE SET
         client_code = excluded.client_code,
@@ -236,7 +289,7 @@ router.post('/sync-customers', async (req, res) => {
 
     const syncAll = db.transaction(() => {
       for (const row of result.data) {
-        upsert.run(row);
+        upsert.run({ ...row, tenant_id: fmsTenant });
       }
     });
     syncAll();
@@ -260,10 +313,9 @@ router.get('/orders', async (req, res) => {
     let where = '1=1';
     const params = [];
 
-    if (isSales(req)) {
-      where += ' AND o.client_id IN (SELECT client_id FROM yunwuyun_customers WHERE sales_name = ?)';
-      params.push(req.user.name);
-    }
+    const orderTenant = isSales(req) ? salesOrderClause(req.user, 'o') : tenantClause(req.user, 'o');
+    where += orderTenant.sql;
+    params.push(...orderTenant.params);
 
     if (search) {
       where += ' AND (job_no LIKE ? OR client_name LIKE ? OR client_code LIKE ?)';
@@ -357,10 +409,9 @@ router.get('/customers', async (req, res) => {
     let where = '1=1';
     const params = [];
 
-    if (isSales(req)) {
-      where += ' AND sales_name = ?';
-      params.push(req.user.name);
-    }
+    const custTenant = isSales(req) ? salesCustomerClause(req.user) : tenantClause(req.user, 'c');
+    where += custTenant.sql;
+    params.push(...custTenant.params);
 
     if (search) {
       where += ` AND (
@@ -377,7 +428,7 @@ router.get('/customers', async (req, res) => {
       params.push(parseInt(inuse));
     }
 
-    const total = db.prepare(`SELECT COUNT(*) as cnt FROM yunwuyun_customers WHERE ${where}`).get(...params).cnt;
+    const total = db.prepare(`SELECT COUNT(*) as cnt FROM yunwuyun_customers c WHERE ${where}`).get(...params).cnt;
     const rows = db.prepare(`SELECT c.*, ft.name AS fee_template_name FROM yunwuyun_customers c LEFT JOIN fee_templates ft ON c.fee_template_id = ft.id WHERE ${where} ORDER BY c.client_name LIMIT ? OFFSET ?`).all(...params, size, offset);
     res.json({ success: true, data: { list: rows, total, page, size } });
   } catch (err) {
@@ -389,18 +440,19 @@ router.get('/customers', async (req, res) => {
 router.get('/customers/filters', async (req, res) => {
   try {
     const db = getDb();
+    const t = isSales(req) ? salesCustomerClause(req.user) : tenantClause(req.user);
     const clientTypes = db.prepare(
-      'SELECT DISTINCT client_type FROM yunwuyun_customers WHERE client_type IS NOT NULL AND client_type != \'\' ORDER BY client_type'
-    ).all().map(r => r.client_type);
+      'SELECT DISTINCT client_type FROM yunwuyun_customers WHERE client_type IS NOT NULL AND client_type != \'\'' + t.sql + ' ORDER BY client_type'
+    ).all(...t.params).map(r => r.client_type);
     const clientClasses = db.prepare(
-      'SELECT DISTINCT client_class FROM yunwuyun_customers WHERE client_class IS NOT NULL AND client_class != \'\' ORDER BY client_class'
-    ).all().map(r => r.client_class);
+      'SELECT DISTINCT client_class FROM yunwuyun_customers WHERE client_class IS NOT NULL AND client_class != \'\'' + t.sql + ' ORDER BY client_class'
+    ).all(...t.params).map(r => r.client_class);
     const salesNames = db.prepare(
-      'SELECT DISTINCT sales_name FROM yunwuyun_customers WHERE sales_name IS NOT NULL AND sales_name != \'\' ORDER BY sales_name'
-    ).all().map(r => r.sales_name);
+      'SELECT DISTINCT sales_name FROM yunwuyun_customers WHERE sales_name IS NOT NULL AND sales_name != \'\'' + t.sql + ' ORDER BY sales_name'
+    ).all(...t.params).map(r => r.sales_name);
     const countryNames = db.prepare(
-      'SELECT DISTINCT country_name FROM yunwuyun_customers WHERE country_name IS NOT NULL AND country_name != \'\' ORDER BY country_name'
-    ).all().map(r => r.country_name);
+      'SELECT DISTINCT country_name FROM yunwuyun_customers WHERE country_name IS NOT NULL AND country_name != \'\'' + t.sql + ' ORDER BY country_name'
+    ).all(...t.params).map(r => r.country_name);
     res.json({ success: true, data: { clientTypes, clientClasses, salesNames, countryNames } });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -413,6 +465,7 @@ router.get('/stats', async (req, res) => {
     const db = getDb();
     const CLOSED = '(close_status IS NULL OR close_status <> 20)';
     let orderCount, customerCount, totals, statusCounts, paidTotal, unsettledTotal;
+    const scope = tenantScope(req.user);
     if (isSales(req)) {
       const clientIds = db.prepare('SELECT client_id FROM yunwuyun_customers WHERE sales_name = ?').all(req.user.name).map(r => r.client_id);
       customerCount = clientIds.length;
@@ -429,11 +482,14 @@ router.get('/stats', async (req, res) => {
         paidTotal = 0;
       }
     } else {
-      orderCount = db.prepare('SELECT COUNT(*) as cnt FROM yunwuyun_orders').get().cnt;
-      customerCount = db.prepare('SELECT COUNT(*) as cnt FROM yunwuyun_customers').get().cnt;
-      totals = db.prepare(`SELECT SUM(ar_amt) as total_ar, SUM(ap_amt) as total_ap, SUM(gr_oss) as total_profit, SUM(ar_amt_cy) as total_ar_cy, SUM(ap_amt_cy) as total_ap_cy, SUM(ar_settled_amt) as total_settled, SUM(ar_unsettled_amt) as total_unsettled FROM yunwuyun_orders WHERE ${CLOSED}`).get();
-      statusCounts = db.prepare('SELECT order_status, COUNT(*) as cnt FROM yunwuyun_orders GROUP BY order_status').all();
-      paidTotal = db.prepare('SELECT COALESCE(SUM(amount), 0) as total FROM client_payments').get().total;
+      const t = tenantClause(req.user);
+      orderCount = db.prepare('SELECT COUNT(*) as cnt FROM yunwuyun_orders WHERE 1=1' + t.sql).get(...t.params).cnt;
+      customerCount = db.prepare('SELECT COUNT(*) as cnt FROM yunwuyun_customers WHERE 1=1' + t.sql).get(...t.params).cnt;
+      totals = db.prepare(`SELECT SUM(ar_amt) as total_ar, SUM(ap_amt) as total_ap, SUM(gr_oss) as total_profit, SUM(ar_amt_cy) as total_ar_cy, SUM(ap_amt_cy) as total_ap_cy, SUM(ar_settled_amt) as total_settled, SUM(ar_unsettled_amt) as total_unsettled FROM yunwuyun_orders WHERE ${CLOSED}` + t.sql).get(...t.params);
+      statusCounts = db.prepare('SELECT order_status, COUNT(*) as cnt FROM yunwuyun_orders WHERE 1=1' + t.sql + ' GROUP BY order_status').all(...t.params);
+      paidTotal = scope === undefined
+        ? db.prepare('SELECT COALESCE(SUM(amount), 0) as total FROM client_payments').get().total
+        : db.prepare('SELECT COALESCE(SUM(amount), 0) as total FROM client_payments WHERE client_id IN (SELECT client_id FROM yunwuyun_customers WHERE tenant_id = ?)').get(scope).total;
     }
     const totalAR = totals.total_ar || 0;
     const totalArCy = totals.total_ar_cy || totalAR;
@@ -496,6 +552,16 @@ router.get('/payments', async (req, res) => {
 
     const conds = [];
     const params = [];
+    if (isSales(req)) {
+      conds.push('p.client_id IN (SELECT client_id FROM yunwuyun_customers WHERE sales_name = ?)');
+      params.push(req.user.name || '');
+    } else {
+      const scope = tenantScope(req.user);
+      if (scope !== undefined) {
+        conds.push('p.client_id IN (SELECT client_id FROM yunwuyun_customers WHERE tenant_id = ?)');
+        params.push(scope);
+      }
+    }
     if (clientId) { conds.push('p.client_id = ?'); params.push(clientId); }
     if (jobId) { conds.push('p.job_id = ?'); params.push(jobId); }
     const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
@@ -524,6 +590,9 @@ router.get('/payments/summary', async (req, res) => {
     const db = getDb();
     const clientId = req.query.client_id ? parseInt(req.query.client_id) : null;
     if (!clientId) return res.status(400).json({ success: false, error: '缺少 client_id' });
+
+    const customer = db.prepare('SELECT client_id, tenant_id, sales_name FROM yunwuyun_customers WHERE client_id = ?').get(clientId);
+    if (!canAccessCustomer(req.user, customer)) return res.status(404).json({ success: false, error: '客户不存在' });
 
     const totalAR = db.prepare(
       "SELECT COALESCE(SUM(ar_amt_cy), 0) as total_cy, COALESCE(SUM(ar_amt), 0) as total FROM yunwuyun_orders WHERE client_id = ? AND (close_status IS NULL OR close_status <> 20)"
@@ -582,8 +651,8 @@ router.post('/payments', async (req, res) => {
       return res.status(400).json({ success: false, error: '回款金额必须大于 0' });
     }
 
-    const client = db.prepare('SELECT client_id FROM yunwuyun_customers WHERE client_id = ?').get(client_id);
-    if (!client) return res.status(404).json({ success: false, error: '客户不存在' });
+    const client = db.prepare('SELECT client_id, tenant_id, sales_name FROM yunwuyun_customers WHERE client_id = ?').get(client_id);
+    if (!canAccessCustomer(req.user, client)) return res.status(404).json({ success: false, error: '客户不存在' });
 
     if (job_id) {
       const order = db.prepare('SELECT job_id, client_id FROM yunwuyun_orders WHERE job_id = ?').get(job_id);
@@ -619,6 +688,8 @@ router.put('/payments/:id', async (req, res) => {
     const db = getDb();
     const existing = db.prepare('SELECT * FROM client_payments WHERE id = ?').get(req.params.id);
     if (!existing) return res.status(404).json({ success: false, error: '回款记录不存在' });
+    const customer = db.prepare('SELECT client_id, tenant_id, sales_name FROM yunwuyun_customers WHERE client_id = ?').get(existing.client_id);
+    if (!canAccessCustomer(req.user, customer)) return res.status(404).json({ success: false, error: '回款记录不存在' });
 
     const { amount, currency, paid_at, remark, job_id } = req.body || {};
     const num = amount == null ? existing.amount : Number(amount);
@@ -647,8 +718,10 @@ router.put('/payments/:id', async (req, res) => {
 router.delete('/payments/:id', async (req, res) => {
   try {
     const db = getDb();
-    const existing = db.prepare('SELECT id FROM client_payments WHERE id = ?').get(req.params.id);
+    const existing = db.prepare('SELECT id, client_id FROM client_payments WHERE id = ?').get(req.params.id);
     if (!existing) return res.status(404).json({ success: false, error: '回款记录不存在' });
+    const customer = db.prepare('SELECT client_id, tenant_id, sales_name FROM yunwuyun_customers WHERE client_id = ?').get(existing.client_id);
+    if (!canAccessCustomer(req.user, customer)) return res.status(404).json({ success: false, error: '回款记录不存在' });
     db.prepare('DELETE FROM client_payments WHERE id = ?').run(req.params.id);
     res.json({ success: true, data: { id: Number(req.params.id) } });
   } catch (err) {
@@ -661,7 +734,7 @@ router.get('/orders/:id', async (req, res) => {
   try {
     const db = getDb();
     const row = db.prepare('SELECT * FROM yunwuyun_orders WHERE job_id = ?').get(req.params.id);
-    if (!row) return res.status(404).json({ success: false, error: '订单不存在' });
+    if (!row || !canAccessOrder(db, req.user, row)) return res.status(404).json({ success: false, error: '订单不存在' });
     res.json({ success: true, data: row });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -673,7 +746,7 @@ router.put('/orders/:id', async (req, res) => {
   try {
     const db = getDb();
     const existing = db.prepare('SELECT * FROM yunwuyun_orders WHERE job_id = ?').get(req.params.id);
-    if (!existing) return res.status(404).json({ success: false, error: '订单不存在' });
+    if (!existing || !canAccessOrder(db, req.user, existing)) return res.status(404).json({ success: false, error: '订单不存在' });
 
     const allowed = ['job_no','job_type','job_date','order_status','close_status','client_name','client_name_eng',
       'client_code','client_abbr','carrier_name','vessel','voyage','etd','eta','atd','so_no','bl_no_domestic',
@@ -707,7 +780,7 @@ router.delete('/orders/:id', async (req, res) => {
   try {
     const db = getDb();
     const existing = db.prepare('SELECT * FROM yunwuyun_orders WHERE job_id = ?').get(req.params.id);
-    if (!existing) return res.status(404).json({ success: false, error: '订单不存在' });
+    if (!existing || !canAccessOrder(db, req.user, existing)) return res.status(404).json({ success: false, error: '订单不存在' });
     db.prepare('DELETE FROM yunwuyun_orders WHERE job_id = ?').run(req.params.id);
     res.json({ success: true, data: {} });
   } catch (err) {
@@ -751,6 +824,11 @@ router.post('/orders', async (req, res) => {
     vals.push(now);
     fields.push('synced_at');
 
+    // 主体归属：主体账号归本主体，平台管理员新增归美鸥主公司（FMS 数据主体）
+    fields.push('tenant_id');
+    placeholders.push('?');
+    vals.push(req.user.tenant_id ?? fmsTenantId(db));
+
     // 生成唯一ID
     const maxId = db.prepare('SELECT MAX(job_id) as mx FROM yunwuyun_orders').get()?.mx || 0;
     const newId = Math.max(maxId + 1, Date.now());
@@ -767,7 +845,7 @@ router.get('/customers/:id', async (req, res) => {
   try {
     const db = getDb();
     const row = db.prepare('SELECT * FROM yunwuyun_customers WHERE client_id = ?').get(req.params.id);
-    if (!row) return res.status(404).json({ success: false, error: '客户不存在' });
+    if (!row || !canAccessCustomer(req.user, row)) return res.status(404).json({ success: false, error: '客户不存在' });
     res.json({ success: true, data: row });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -779,7 +857,7 @@ router.put('/customers/:id', async (req, res) => {
   try {
     const db = getDb();
     const existing = db.prepare('SELECT * FROM yunwuyun_customers WHERE client_id = ?').get(req.params.id);
-    if (!existing) return res.status(404).json({ success: false, error: '客户不存在' });
+    if (!existing || !canAccessCustomer(req.user, existing)) return res.status(404).json({ success: false, error: '客户不存在' });
 
     const allowed = ['client_code','client_name','client_name_eng','client_abbr','client_type','client_class',
       'client_class_eng','client_property','client_same_industry','country_id','country_code','country_name',
@@ -814,7 +892,7 @@ router.put('/customers/:id/assign-sales', async (req, res) => {
     }
     const db = getDb();
     const existing = db.prepare('SELECT * FROM yunwuyun_customers WHERE client_id = ?').get(req.params.id);
-    if (!existing) return res.status(404).json({ success: false, error: '客户不存在' });
+    if (!existing || !canAccessCustomer(req.user, existing)) return res.status(404).json({ success: false, error: '客户不存在' });
     db.prepare('UPDATE yunwuyun_customers SET sales_name = ? WHERE client_id = ?').run(sales_name, req.params.id);
     res.json({ success: true, data: { sales_name } });
   } catch (err) {
@@ -834,7 +912,10 @@ router.post('/customers/batch-assign-sales', async (req, res) => {
     }
     const db = getDb();
     const placeholders = client_ids.map(() => '?').join(',');
-    const result = db.prepare(`UPDATE yunwuyun_customers SET sales_name = ? WHERE client_id IN (${placeholders})`).run(sales_name, ...client_ids);
+    const scope = tenantScope(req.user);
+    const result = scope === undefined
+      ? db.prepare(`UPDATE yunwuyun_customers SET sales_name = ? WHERE client_id IN (${placeholders})`).run(sales_name, ...client_ids)
+      : db.prepare(`UPDATE yunwuyun_customers SET sales_name = ? WHERE client_id IN (${placeholders}) AND tenant_id = ?`).run(sales_name, ...client_ids, scope);
     res.json({ success: true, data: { updated: result.changes } });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -847,9 +928,9 @@ router.put('/customers/:id/fee-template', async (req, res) => {
     const { template_id } = req.body;
     const db = getDb();
     const existing = db.prepare('SELECT * FROM yunwuyun_customers WHERE client_id = ?').get(req.params.id);
-    if (!existing) return res.status(404).json({ success: false, error: '客户不存在' });
+    if (!existing || !canAccessCustomer(req.user, existing)) return res.status(404).json({ success: false, error: '客户不存在' });
     if (template_id) {
-      const tpl = db.prepare('SELECT id, name FROM fee_templates WHERE id = ?').get(template_id);
+      const tpl = db.prepare('SELECT id, name FROM fee_templates WHERE id = ? AND (tenant_id = ? OR tenant_id IS NULL)').get(template_id, existing.tenant_id);
       if (!tpl) return res.status(404).json({ success: false, error: '模版不存在' });
       db.prepare('UPDATE yunwuyun_customers SET fee_template_id = ? WHERE client_id = ?').run(template_id, req.params.id);
       res.json({ success: true, data: { fee_template_id: template_id, fee_template_name: tpl.name } });
@@ -867,7 +948,7 @@ router.delete('/customers/:id', async (req, res) => {
   try {
     const db = getDb();
     const existing = db.prepare('SELECT * FROM yunwuyun_customers WHERE client_id = ?').get(req.params.id);
-    if (!existing) return res.status(404).json({ success: false, error: '客户不存在' });
+    if (!existing || !canAccessCustomer(req.user, existing)) return res.status(404).json({ success: false, error: '客户不存在' });
     db.prepare('DELETE FROM yunwuyun_customers WHERE client_id = ?').run(req.params.id);
     res.json({ success: true, data: {} });
   } catch (err) {
@@ -906,6 +987,11 @@ router.post('/customers', async (req, res) => {
     vals.push(now);
     fields.push('synced_at');
 
+    // 主体归属：主体账号归本主体，平台管理员新增归美鸥主公司（FMS 数据主体）
+    fields.push('tenant_id');
+    placeholders.push('?');
+    vals.push(req.user.tenant_id ?? fmsTenantId(db));
+
     const maxId = db.prepare('SELECT MAX(client_id) as mx FROM yunwuyun_customers').get()?.mx || 0;
     const newId = Math.max(maxId + 1, Date.now());
     db.prepare(`INSERT INTO yunwuyun_customers (client_id, ${fields.join(', ')}) VALUES (?, ${placeholders.join(', ')})`)
@@ -929,6 +1015,10 @@ router.put('/customers/:id/enable-login', async (req, res) => {
     if (!password || password.length < 4) {
       return res.json({ success: false, error: '密码长度至少4位' });
     }
+    const existing = db.prepare('SELECT client_id, tenant_id, sales_name FROM yunwuyun_customers WHERE client_id = ?').get(parseInt(req.params.id));
+    if (!existing || !canAccessCustomer(req.user, existing)) {
+      return res.status(404).json({ success: false, error: '客户不存在' });
+    }
     // 检查 login_account 是否已被其他客户使用
     const dup = db.prepare(
       'SELECT client_id FROM yunwuyun_customers WHERE login_account = ? AND client_id != ?'
@@ -950,6 +1040,10 @@ router.put('/customers/:id/enable-login', async (req, res) => {
 router.put('/customers/:id/disable-login', async (req, res) => {
   try {
     const db = getDb();
+    const existing = db.prepare('SELECT client_id, tenant_id, sales_name FROM yunwuyun_customers WHERE client_id = ?').get(parseInt(req.params.id));
+    if (!existing || !canAccessCustomer(req.user, existing)) {
+      return res.status(404).json({ success: false, error: '客户不存在' });
+    }
     db.prepare('UPDATE yunwuyun_customers SET login_enabled = 0, login_account = NULL, login_password = NULL WHERE client_id = ?')
       .run(parseInt(req.params.id));
     res.json({ success: true, data: { message: '客户登录已关闭' } });
@@ -966,9 +1060,9 @@ router.put('/customers/:id/reset-password', async (req, res) => {
     if (!password || password.length < 4) {
       return res.json({ success: false, error: '密码长度至少4位' });
     }
-    const customer = db.prepare('SELECT login_enabled FROM yunwuyun_customers WHERE client_id = ?')
+    const customer = db.prepare('SELECT login_enabled, tenant_id, sales_name FROM yunwuyun_customers WHERE client_id = ?')
       .get(parseInt(req.params.id));
-    if (!customer) return res.json({ success: false, error: '客户不存在' });
+    if (!customer || !canAccessCustomer(req.user, customer)) return res.json({ success: false, error: '客户不存在' });
     if (!customer.login_enabled) return res.json({ success: false, error: '该客户尚未开通登录' });
 
     const hashed = bcrypt.hashSync(password, 10);
